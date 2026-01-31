@@ -18,8 +18,22 @@ except ImportError:
 
 def load_and_project_weights(student_model, teacher_state_dict, config=None, device="cuda"):
     """
-    Loads weights from Teacher (Wan 2.2) to Student.
-    Robustly handles dimension mismatches by injecting projection layers.
+    Loads weights from Teacher (Wan 2.2 - 3D Video Model) to Student (2D Image Model).
+    
+    This function handles the conversion from a 3D video generation model to a 2D
+    image generation model by:
+    1. Stripping temporal dimensions from the teacher model
+    2. Projecting weights when dimensions don't match
+    3. Intelligently initializing projection layers for size mismatches
+    
+    The teacher model has temporal/motion components that are removed in the student.
+    The student is purely spatial (2D) for static image generation.
+    
+    Args:
+        student_model: The 2D student model to initialize
+        teacher_state_dict: State dict from the 3D teacher model
+        config: Configuration with student architecture details
+        device: Device to place weights on
     """
     if config is None:
         config = StudentConfig()
