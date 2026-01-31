@@ -227,7 +227,8 @@ def load_config(json_path):
             "image_size": data.get("image_size"),
             "patch_size": data.get("patch_size"),
             "text_max_length": data.get("text_max_length"),
-            "text_encoder_output_dim": data.get("text_encoder_output_dim")
+            "text_encoder_output_dim": data.get("text_encoder_output_dim"),
+            "projection_factor": data.get("projection_factor")
         }
 
         return config_vars
@@ -267,7 +268,8 @@ def main():
         return
 
     # 3. Initialize Student Model
-    student_model = WanLiteStudent(student_config).to(device)
+    # Initialize with teacher checkpoint path to enable weight projection
+    student_model = WanLiteStudent(student_config, teacher_checkpoint_path=args.teacher_path).to(device)
 
     # 4. Initialize Teacher Model (Diffusers)
     # This loads the model from the path specified in main.py
@@ -297,15 +299,43 @@ def main():
     for epoch in range(args.num_epochs):
         for batch in dataloader:
             # --- DATA PREPARATION ---
-            text_embeddings = batch['text_embeddings'].to(device)
+            # batch is a list of prompt strings
+            prompts = batch
+            
+            # Encode the prompts using the teacher's text encoder
+            # For Diffusers models, text encoding is usually done via encode_prompt or similar
+            # We'll use a simple approach assuming teacher_pipe has text_encoder
+            if hasattr(teacher_pipe, 'encode_prompt'):
+                # Use encode_prompt if available
+                text_embeddings = teacher_pipe.encode_prompt(
+                    prompts, 
+                    device=device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=False
+                )[0]
+            elif hasattr(teacher_pipe, 'text_encoder'):
+                # Fallback to direct text encoder usage
+                if hasattr(teacher_pipe, 'tokenizer'):
+                    text_inputs = teacher_pipe.tokenizer(
+                        prompts,
+                        padding="max_length",
+                        max_length=teacher_pipe.tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    ).to(device)
+                    text_embeddings = teacher_pipe.text_encoder(text_inputs.input_ids)[0]
+                else:
+                    raise ValueError("Text encoder found but no tokenizer available")
+            else:
+                raise ValueError("No text encoder found in teacher pipeline")
 
             # Generate random timesteps and latents for the step
             # Shape: [batch_size, 16, 16, 4] (Example based on patch_size=16 and num_channels=4)
             latents = torch.randn(
                 args.batch_size,
-                student_config.num_channels,
-                student_config.image_size // student_config.patch_size,
-                student_config.image_size // student_config.patch_size,
+                student_config["num_channels"],
+                student_config["image_size"] // student_config["patch_size"],
+                student_config["image_size"] // student_config["patch_size"],
                 device=device
             )
 

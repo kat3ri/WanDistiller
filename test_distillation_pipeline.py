@@ -64,14 +64,13 @@ class TestFullPipeline(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     @patch('torch.device')
-    @patch('torch.randn')
     # UPDATE: Patch the specific class from train_distillation
     @patch('train_distillation.WanLiteStudent')
     @patch('train_distillation.DiffusionPipeline')  # Mock the teacher loading
     @patch('train_distillation.StaticPromptsDataset')
     # UPDATE: Patch load_and_project_weights based on your projection_mapper.py
     @patch('train_distillation.load_and_project_weights')
-    def test_main_integration(self, mock_proj, mock_dataset, mock_diffusion, mock_student, mock_randn, mock_device):
+    def test_main_integration(self, mock_proj, mock_dataset, mock_diffusion, mock_student, mock_device):
         """
         This test ensures that:
         1. load_config is called.
@@ -79,24 +78,43 @@ class TestFullPipeline(unittest.TestCase):
         3. load_and_project_weights is called.
         4. StaticPromptsDataset is used.
         """
-
+        # Import torch before setting up mocks that need it
+        import torch as real_torch
+        
         # Mock return values
         mock_device.return_value = "cpu"
-        mock_randn.return_value = "mock_latents_tensor"
 
         # Mock Teacher Pipeline
-        mock_diffusion.return_value = MagicMock(transformer=MagicMock())
+        mock_teacher_pipe = MagicMock()
+        # Mock transformer to return tensor when called
+        mock_teacher_output = real_torch.randn(2, 4, 64, 64)  # batch_size=2, num_channels=4, 64x64
+        mock_teacher_pipe.transformer = MagicMock(return_value=mock_teacher_output)
+        mock_teacher_pipe.transformer.eval = MagicMock()
+        # Mock to() method to return self
+        mock_teacher_pipe.to = MagicMock(return_value=mock_teacher_pipe)
+        # Mock encode_prompt to return text embeddings
+        mock_text_emb = real_torch.randn(2, 4096)  # batch_size=2, text_encoder_output_dim=4096
+        mock_teacher_pipe.encode_prompt = MagicMock(return_value=(mock_text_emb,))
+        mock_diffusion.from_pretrained = MagicMock(return_value=mock_teacher_pipe)
 
         # Mock Dataset
         mock_dataset_instance = MagicMock()
-        mock_dataset_instance.__len__ = MagicMock(return_value=1)
-        mock_batch = {'text_embeddings': 'mock_text'}
-        mock_dataset_instance.__iter__ = MagicMock(return_value=[mock_batch])
+        mock_dataset_instance.__len__ = MagicMock(return_value=2)
+        # Dataset should return prompt strings when __getitem__ is called
+        mock_dataset_instance.__getitem__ = MagicMock(side_effect=lambda idx: ["test prompt 1", "test prompt 2"][idx])
+        mock_dataset.return_value = mock_dataset_instance
 
         # Mock Student
-        mock_student_instance = MagicMock()
+        mock_param = real_torch.nn.Parameter(real_torch.randn(2, 4, 64, 64))
+        # Create output that has grad_fn by performing an operation on the parameter
+        mock_student_output = mock_param + 0  # This creates a tensor with grad_fn
+        mock_student_instance = MagicMock(return_value=mock_student_output)
         mock_student_instance.train = MagicMock()
         mock_student_instance.save_pretrained = MagicMock()
+        # Mock parameters to return a real tensor that can be optimized
+        mock_student_instance.parameters = MagicMock(return_value=[mock_param])
+        # Mock to() method to return self
+        mock_student_instance.to = MagicMock(return_value=mock_student_instance)
         mock_student.return_value = mock_student_instance
 
         # Setup sys.argv to match main.py style
@@ -106,7 +124,7 @@ class TestFullPipeline(unittest.TestCase):
             "--student_config", self.mock_args["student_config"],
             "--data_path", self.mock_args["data_path"],
             "--output_dir", self.mock_args["output_dir"],
-            "--batch_size", self.mock_args["batch_size"],
+            "--batch_size", str(self.mock_args["batch_size"]),
             "--lr", str(self.mock_args["lr"])
         ]
 
@@ -114,11 +132,12 @@ class TestFullPipeline(unittest.TestCase):
         train_distillation.main()
 
         # Assertions
-        # 1. Verify WanLiteStudent was initialized with config
-        mock_student.assert_called_once_with(self.test_config)
+        # 1. Verify WanLiteStudent was initialized with config and teacher_checkpoint_path
+        mock_student.assert_called_once_with(self.test_config, teacher_checkpoint_path=self.mock_args["teacher_path"])
 
-        # 2. Verify load_and_project_weights was called
-        mock_proj.assert_called_once()
+        # 2. Note: load_and_project_weights is called inside WanLiteStudent.__init__, 
+        # but since we're mocking WanLiteStudent, the real __init__ never runs.
+        # Therefore, we cannot assert that load_and_project_weights was called in this test.
 
         # 3. Verify save_pretrained was called with output_dir
         mock_student_instance.save_pretrained.assert_called_once_with(self.mock_args["output_dir"])
