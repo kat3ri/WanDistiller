@@ -42,9 +42,15 @@ def create_mock_teacher_pipeline(device="cpu"):
     # Create a simple function that returns a tensor when called
     def mock_transformer_forward(*args, **kwargs):
         # Return a tensor matching the expected output shape
-        # batch_size=2, num_channels=4, 64x64 latent space
-        batch_size = kwargs.get('sample').shape[0] if 'sample' in kwargs else 2
-        return torch.randn(batch_size, 4, 64, 64, device=device)
+        # The shape should match the student's latent spatial dimensions
+        sample = kwargs.get('sample')
+        if sample is not None:
+            batch_size, channels, h, w = sample.shape
+            # Return same spatial dimensions as input
+            return torch.randn(batch_size, channels, h, w, device=device)
+        else:
+            # Fallback
+            return torch.randn(2, 4, 16, 16, device=device)
     
     mock_transformer.side_effect = mock_transformer_forward
     mock_transformer.eval = MagicMock()
@@ -53,8 +59,9 @@ def create_mock_teacher_pipeline(device="cpu"):
     # Mock encode_prompt to return text embeddings
     def mock_encode_prompt(prompts, device, num_images_per_prompt=1, do_classifier_free_guidance=False):
         batch_size = len(prompts) if isinstance(prompts, list) else 1
-        # Return tensor with shape (batch_size, text_encoder_output_dim)
-        return (torch.randn(batch_size, 4096, device=device),)
+        # Return tensor with shape (batch_size, seq_len, text_encoder_output_dim)
+        # Standard text sequence length is 77 for most diffusion models
+        return (torch.randn(batch_size, 77, 4096, device=device),)
     
     mock_pipe.encode_prompt = mock_encode_prompt
     mock_pipe.to = MagicMock(return_value=mock_pipe)
@@ -115,7 +122,15 @@ def run_production_test(use_mock_teacher=True, num_epochs=2, batch_size=2):
     # Load and validate config
     try:
         config = train_distillation.load_config(config_path)
-        print(f"✓ Config loaded successfully")
+        
+        # For testing purposes, use a much smaller model to avoid memory issues
+        print(f"⚙️  Adjusting model config for testing (reducing size to fit in memory)")
+        config["hidden_size"] = 256  # Reduced from 1024
+        config["depth"] = 4  # Reduced from 16
+        config["num_heads"] = 4  # Reduced from 16
+        config["image_size"] = 256  # Reduced from 1024 for faster testing
+        
+        print(f"✓ Config loaded and adjusted for testing")
         print(f"  - Model type: {config.get('model_type', 'N/A')}")
         print(f"  - Hidden size: {config.get('hidden_size', 'N/A')}")
         print(f"  - Depth: {config.get('depth', 'N/A')}")

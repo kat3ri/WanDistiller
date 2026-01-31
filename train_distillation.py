@@ -74,7 +74,7 @@ class WanTransformerBlock(nn.Module):
         # 2. Add time embedding to the input (Conditioning)
         # This is the missing step. We add t_emb to x to condition the block
         # on the current diffusion timestep.
-        x = x + t_emb
+        x = x + t_emb.unsqueeze(1)
 
         # Attention Block
         attn_output, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
@@ -94,7 +94,14 @@ class WanTransformerBlock(nn.Module):
 
 class WanLiteStudent(nn.Module):
     """
-    WanLiteStudent model definition integrated with projection_mapper.
+    WanLiteStudent model definition - A 2D image-only model.
+    
+    This model is designed for static image generation (Text-to-Image),
+    not video generation. It receives projected weights from the teacher
+    video model (Wan 2.2) but strips out all temporal/motion components.
+    
+    The projection_mapper handles converting the teacher's 3D video weights
+    to the student's 2D image architecture.
     """
 
     def __init__(self, config, teacher_checkpoint_path=None, device="cuda"):
@@ -114,7 +121,7 @@ class WanLiteStudent(nn.Module):
         # Defined here to be populated by load_and_project_weights
         self.text_proj = nn.Linear(text_encoder_output_dim, hidden_size)
 
-        # 2. Time Embedding
+        # 2. Time Embedding (for diffusion timesteps)
         time_embed_dim = hidden_size * 4
         self.time_embed = nn.Sequential(
             nn.Linear(hidden_size, time_embed_dim),
@@ -122,17 +129,18 @@ class WanLiteStudent(nn.Module):
             nn.Linear(time_embed_dim, hidden_size)
         )
 
-        # 3. Convolutional Layers
+        # 3. Convolutional Layers (2D only - no temporal dimension)
         self.conv_in = nn.Conv2d(num_channels, hidden_size, kernel_size=3, padding=1)
         self.conv_out = nn.Conv2d(hidden_size, num_channels, kernel_size=3, padding=1)
 
-        # 4. Transformer Blocks
+        # 4. Transformer Blocks (2D spatial attention only)
         self.blocks = nn.ModuleList([
             WanTransformerBlock(hidden_size, num_heads) for _ in range(depth)
         ])
 
         # 5. Apply Projection Mapper
         # Loads weights from the teacher checkpoint and maps them to the student architecture
+        # This handles converting 3D video model weights to 2D image model weights
         if teacher_checkpoint_path is not None:
             load_and_project_weights(teacher_checkpoint_path, self)
 
@@ -141,11 +149,19 @@ class WanLiteStudent(nn.Module):
 
     def forward(self, latent_0, latent_1, timestep, encoder_hidden_states):
         """
-            Forward pass.
-            Now properly utilizing t_emb, text_emb, and latent_1.
-            """
+        Forward pass for 2D image generation (no temporal/video dimensions).
+        
+        Args:
+            latent_0: Input latent tensor (batch, channels, height, width) - 2D spatial only
+            latent_1: Optional conditioning latent (batch, channels, height, width) or None
+            timestep: Diffusion timestep (batch,)
+            encoder_hidden_states: Text embeddings (batch, seq_len, text_dim)
+        
+        Returns:
+            Output prediction (batch, channels, height, width) - 2D spatial only
+        """
 
-        # 1. Convolutional Input
+        # 1. Convolutional Input (2D spatial only)
         # We add latent_1 to the input if it is a conditioning latent
         # (depending on architecture, latent_1 might be added here or passed into blocks)
         x = self.conv_in(latent_0)
@@ -153,17 +169,37 @@ class WanLiteStudent(nn.Module):
             x = x + latent_1
 
         # 2. Time Embedding
-        t_emb = self.time_embed(timestep)
+        # Convert timestep to float and create sinusoidal embeddings
+        if timestep.dtype != torch.float32:
+            timestep = timestep.float()
+        
+        # Create sinusoidal time embeddings
+        batch_size = x.shape[0]
+        half_dim = self.config["hidden_size"] // 2
+        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
+        emb = timestep[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        
+        t_emb = self.time_embed(emb)
 
         # 3. Text Embedding Projection
-        text_emb = self.text_proj(encoder_hidden_states)
+        # Average pool the text embeddings to get a single vector per batch
+        text_emb = self.text_proj(encoder_hidden_states.mean(dim=1))
 
-        # 4. Transformer Processing
+        # 4. Transformer Processing (2D spatial attention only)
+        # Reshape x for transformer: (batch, channels, h, w) -> (batch, h*w, channels)
+        batch, channels, h, w = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (batch, h*w, channels)
+        
         # We must pass t_emb and text_emb to every block now
         for block in self.blocks:
             x = block(x, t_emb, text_emb)
+        
+        # Reshape back: (batch, h*w, channels) -> (batch, channels, h, w)
+        x = x.transpose(1, 2).reshape(batch, channels, h, w)
 
-        # 5. Convolutional Output
+        # 5. Convolutional Output (2D spatial only)
         student_output = self.conv_out(x)
         return student_output
 
