@@ -1,17 +1,32 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from diffusers import WanVideoToVideoPipeline, DDPMScheduler
-from transformers import AutoTokenizer
-from tqdm.auto import tqdm
 import argparse
 import json
 import os
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from diffusers import DiffusionPipeline
+from safetensors.torch import save_file
+
+from projection_mapper import load_and_project_weights
 
 
-class StaticPromptsDataset(Dataset):
-    def __init__(self, file_path):
+
+# -----------------------------------------------------------------------------
+# Dataset Configuration
+# -----------------------------------------------------------------------------
+
+class StaticPromptsDataset(torch.utils.data.Dataset):
+    """
+    Dataset to load prompts from a text file.
+    """
+
+    def __init__(self, file_path, tokenizer=None, max_length=77):
+        self.prompts = []
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        # Load prompts from the provided text file
         with open(file_path, 'r', encoding='utf-8') as f:
             self.prompts = [line.strip() for line in f if line.strip()]
 
@@ -22,168 +37,313 @@ class StaticPromptsDataset(Dataset):
         return self.prompts[idx]
 
 
+# -----------------------------------------------------------------------------
+# Model Definition
+# -----------------------------------------------------------------------------
+
+class WanTransformerBlock(nn.Module):
+    """
+    A basic Transformer block component.
+    Injects time and text embeddings into the processing.
+    """
+
+    def __init__(self, hidden_size, num_heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(hidden_size)
+
+        # MLP usually takes time embedding to scale its activation
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, 4 * hidden_size),
+            nn.SiLU(),
+            nn.Linear(4 * hidden_size, hidden_size)
+        )
+
+    def forward(self, x, t_emb, text_emb):
+        """
+        x: image latent (batch, seq, hidden_size)
+        t_emb: timestep embedding (batch, hidden_size)
+        text_emb: text embedding (batch, hidden_size)
+        """
+
+        # 1. Add text embedding to the input (Conditioning)
+        # We add text_emb to x before processing
+        x = x + text_emb.unsqueeze(1)
+
+        # 2. Add time embedding to the input (Conditioning)
+        # This is the missing step. We add t_emb to x to condition the block
+        # on the current diffusion timestep.
+        x = x + t_emb
+
+        # Attention Block
+        attn_output, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
+        x = x + attn_output
+
+        # MLP Block
+        mlp_input = self.norm2(x)
+
+        # You can also use t_emb here if you want to scale the MLP activation,
+        # but simple addition is the standard DiT approach.
+
+        mlp_output = self.mlp(mlp_input)
+        x = x + mlp_output
+
+        return x
+
+
 class WanLiteStudent(nn.Module):
     """
-    A simplified student architecture based on the provided config.
-    Note: This is a scaffold for the architecture. 
-    In a real scenario, this would mirror the internal layers of Wan-Lite.
+    WanLiteStudent model definition integrated with projection_mapper.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, teacher_checkpoint_path=None, device="cuda"):
         super().__init__()
-        self.hidden_size = config['hidden_size']
-        self.num_heads = config['num_heads']
-        self.depth = config['depth']
-        self.patch_size = config['m_patch_size']
+        self.config = config
+        self.device = device
 
-        # Example: Embedding layers (Scaffold)
-        self.time_embedding = nn.Linear(320, self.hidden_size)
-        self.class_embedding = nn.Embedding(1000, self.hidden_size)
+        # Extract configuration parameters
+        hidden_size = config["hidden_size"]
+        depth = config["depth"]
+        num_heads = config["num_heads"]
+        num_channels = config["num_channels"]
+        text_encoder_output_dim = config["text_encoder_output_dim"]
 
-        # Transformer Layers (Scaffold)
-        self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.hidden_size,
-                nhead=self.num_heads,
-                dim_feedforward=self.hidden_size * 4,
-                batch_first=True
-            )
-            for _ in range(self.depth)
+        # 1. Text Projection Layer
+        # Maps text encoder output (e.g., 4096) down to hidden size (e.g., 640)
+        # Defined here to be populated by load_and_project_weights
+        self.text_proj = nn.Linear(text_encoder_output_dim, hidden_size)
+
+        # 2. Time Embedding
+        time_embed_dim = hidden_size * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(hidden_size, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, hidden_size)
+        )
+
+        # 3. Convolutional Layers
+        self.conv_in = nn.Conv2d(num_channels, hidden_size, kernel_size=3, padding=1)
+        self.conv_out = nn.Conv2d(hidden_size, num_channels, kernel_size=3, padding=1)
+
+        # 4. Transformer Blocks
+        self.blocks = nn.ModuleList([
+            WanTransformerBlock(hidden_size, num_heads) for _ in range(depth)
         ])
 
-        # Output layer
-        self.norm = nn.LayerNorm(self.hidden_size)
-        self.proj_out = nn.Linear(self.hidden_size, 320)  # Output channels matching input noise
+        # 5. Apply Projection Mapper
+        # Loads weights from the teacher checkpoint and maps them to the student architecture
+        if teacher_checkpoint_path is not None:
+            load_and_project_weights(teacher_checkpoint_path, self)
 
-    def forward(self, noisy_latents, timestep, prompt_embeds):
-        # 1. Process Time Embedding
-        time_emb = self.time_embedding(timestep)
+        # Move to device
+        self.to(device)
 
-        # 2. Add embeddings to latents (Simplified concat)
-        x = noisy_latents + time_emb.unsqueeze(1)
+    def forward(self, latent_0, latent_1, timestep, encoder_hidden_states):
+        """
+            Forward pass.
+            Now properly utilizing t_emb, text_emb, and latent_1.
+            """
 
-        # 3. Pass through transformer blocks
-        for layer in self.layers:
-            x = layer(x)
+        # 1. Convolutional Input
+        # We add latent_1 to the input if it is a conditioning latent
+        # (depending on architecture, latent_1 might be added here or passed into blocks)
+        x = self.conv_in(latent_0)
+        if latent_1 is not None:
+            x = x + latent_1
 
-        x = self.norm(x)
+        # 2. Time Embedding
+        t_emb = self.time_embed(timestep)
 
-        # 4. Predict noise
-        noise_pred = self.proj_out(x)
+        # 3. Text Embedding Projection
+        text_emb = self.text_proj(encoder_hidden_states)
 
-        return noise_pred
+        # 4. Transformer Processing
+        # We must pass t_emb and text_emb to every block now
+        for block in self.blocks:
+            x = block(x, t_emb, text_emb)
 
+        # 5. Convolutional Output
+        student_output = self.conv_out(x)
+        return student_output
+
+    def save_pretrained(self, output_dir):
+        """
+        Saves the model as a Diffusers-compatible structure.
+        Saves:
+        1. student_config.json (The configuration)
+        2. diffusion_model.safetensors (The weights)
+        """
+
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1. Save Configuration as JSON
+        # Diffusers requires the config to be a JSON file
+        config = self.config
+        config_path = os.path.join(output_dir, "student_config.json")
+
+        # Ensure specific keys match Diffusers expectations if necessary,
+        # or just save the current config.
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=4)
+
+        # 2. Save Weights as Safetensors
+        # This is the standard format for Diffusers
+        weights_path = os.path.join(output_dir, "diffusion_model.safetensors")
+
+        # Note: We only save the state_dict here.
+        # You might need to filter keys here if the state_dict has extra keys
+        # (like 'epoch' or 'optimizer') that you don't want to save.
+        save_file(self.state_dict(), weights_path)
+
+        print(f"Model saved successfully to: {output_dir}")
+
+
+
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+
+import json
+
+
+def load_config(json_path):
+    """
+    Load the student configuration from the provided JSON file.
+    Returns a dictionary containing model architecture and shape parameters.
+    """
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        config_vars = {
+            "model_type": data.get("model_type"),
+            "hidden_size": data.get("hidden_size"),
+            "depth": data.get("depth"),
+            "num_heads": data.get("num_heads"),
+            "num_channels": data.get("num_channels"),
+            "image_size": data.get("image_size"),
+            "patch_size": data.get("patch_size"),
+            "text_max_length": data.get("text_max_length"),
+            "text_encoder_output_dim": data.get("text_encoder_output_dim")
+        }
+
+        return config_vars
+
+    except FileNotFoundError:
+        print(f"Error: Config file not found at {json_path}")
+        return None
+    except json.JSONDecodeError:
+        print(f"Error: Config file contains invalid JSON syntax.")
+        return None
+
+# -----------------------------------------------------------------------------
+# Main Training Logic
+# -----------------------------------------------------------------------------
 
 def main():
+    # 1. Argument Parsing
     parser = argparse.ArgumentParser()
-    parser.add_argument("--teacher_path", type=str, required=True, help="Path to Wan 2.2 weights")
-    parser.add_argument("--student_config", type=str, default="config/student_config.json")
-    parser.add_argument("--data_path", type=str, default="data/static_prompts.txt")
-    parser.add_argument("--output_dir", type=str, default="./outputs/wan_t2i")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_steps", type=int, default=1000)
+    parser.add_argument("--teacher_path", type=str, required=True)
+    parser.add_argument("--student_config", type=str, required=True)
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--num_steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--num_epochs", type=int, default=10)  # Added this argument
+
     args = parser.parse_args()
 
-    # Setup Output
-    os.makedirs(args.output_dir, exist_ok=True)
+    # 2. Load Configuration
+    student_config = load_config(args.student_config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Load Configuration
-    with open(args.student_config, 'r') as f:
-        student_config = json.load(f)
+    # Safety check to ensure config loaded successfully
+    if student_config is None:
+        print("Error: Could not load student configuration.")
+        return
 
-    # 2. Load Teacher (Wan 2.2 Video Model)
-    # We assume the user has loaded WanVideoToVideoPipeline or similar
-    # Ideally, we load the UNet or VAE here as well, but for distillation 
-    # we often rely on the pipeline's denoising capabilities.
-    print("Loading Teacher (Wan 2.2)...")
-    teacher_pipe = WanVideoToVideoPipeline.from_pretrained(args.teacher_path, torch_dtype=torch.float16)
-    teacher_pipe.scheduler = DDPMScheduler.from_config(teacher_pipe.scheduler.config)
+    # 3. Initialize Student Model
+    student_model = WanLiteStudent(student_config).to(device)
 
-    # Move teacher to GPU
-    teacher_pipe = teacher_pipe.to("cuda")
+    # 4. Initialize Teacher Model (Diffusers)
+    # This loads the model from the path specified in main.py
+    teacher_pipe = DiffusionPipeline.from_pretrained(args.teacher_path)
+    teacher_pipe.to(device)
 
-    # 3. Initialize Student
-    print("Initializing Student (Wan-Lite)...")
-    student = WanLiteStudent(student_config)
-    student = student.to("cuda")
+    # Wan2.1 models usually have the transformer as a specific attribute
+    # Adjust this if your Diffusers model structure is different
+    teacher_model = teacher_pipe.transformer
+    teacher_model.eval()  # Teacher should not be trained
 
-    # 4. Load Data
+    # 5. Initialize Dataset and Dataloader
     dataset = StaticPromptsDataset(args.data_path)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    # 5. Optimizer
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr)
+    # 6. Optimizer and Loss
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.lr)
+    loss_fn = torch.nn.functional.mse_loss
 
-    # 6. Training Loop
-    # Logic:
-    # 1. Teacher generates high-quality single frame from prompt.
-    # 2. We add noise to that image (Diffusion process).
-    # 3. Student predicts noise for the noisy image.
-    # 4. Compare Student's prediction to the Teacher's "expected" noise (simulated via target generation or just image fidelity).
-    # For this scaffold, we use standard distillation: Student predicts noise, Teacher provides the target noise prediction.
-
-    print("Starting Distillation Training...")
-
-    # We'll use the teacher to generate a clean image, then add noise to it
-    # and use the teacher's forward pass (simulated) to get the target noise.
-    # Note: Actual implementation depends on the exact interface of the Teacher's UNet.
-
+    # 7. Training Loop
+    student_model.train()  # Student needs to be in train mode
     global_step = 0
 
-    for epoch in range(10):  # Example epoch loop
-        for prompts in tqdm(dataloader, desc="Epoch"):
-            optimizer.zero_grad()
+    print("Starting distillation training...")
 
-            # --- Teacher Step (Generating Data) ---
-            # Force 1 frame to ignore temporal motion
+    # Fixed: Use args.num_epochs
+    for epoch in range(args.num_epochs):
+        for batch in dataloader:
+            # --- DATA PREPARATION ---
+            text_embeddings = batch['text_embeddings'].to(device)
+
+            # Generate random timesteps and latents for the step
+            # Shape: [batch_size, 16, 16, 4] (Example based on patch_size=16 and num_channels=4)
+            latents = torch.randn(
+                args.batch_size,
+                student_config.num_channels,
+                student_config.image_size // student_config.patch_size,
+                student_config.image_size // student_config.patch_size,
+                device=device
+            )
+
+            # Generate random timesteps
+            timesteps = torch.randint(0, 1000, (args.batch_size,), device=device).long()
+
+            # --- TEACHER PASS ---
             with torch.no_grad():
-                teacher_output = teacher_pipe(
-                    prompt=prompts,
-                    num_inference_steps=50,  # High denoise steps for quality
-                    num_frames=1,  # Single frame
-                    guidance_scale=7.5
+                # Pass through teacher
+                teacher_output = teacher_model(
+                    sample=latents,
+                    timestep=timesteps,
+                    encoder_hidden_states=text_embeddings,
                 )
-                clean_images = teacher_output.images[0]  # Shape: (B, C, H, W)
 
-            # Add Noise to images (Simulating a diffusion timestep)
-            # We assume a random timestep t between 0 and 1000 for this batch
-            timesteps = torch.randint(0, 1000, (clean_images.size(0),), device="cuda")
+            # --- STUDENT PASS ---
+            student_output = student_model(
+                sample=latents,  # Or appropriate args for WanLiteStudent
+                timestep=timesteps,
+                encoder_hidden_states=text_embeddings,
+            )
 
-            # Add Gaussian Noise
-            noise = torch.randn_like(clean_images)
-            noisy_images = clean_images + noise * 0.1  # Scaling noise factor
+            # --- LOSS CALCULATION ---
+            loss = loss_fn(student_output, teacher_output)
 
-            # Prepare Inputs
-            # Note: Input shape usually expects (B, T, C, H, W). Since T=1, squeeze or keep as is.
-            noisy_images = noisy_images.unsqueeze(1)
-            noise = noise.unsqueeze(1)
-            clean_images = clean_images.unsqueeze(1)
-            timesteps = timesteps.unsqueeze(1)
-
-            # --- Student Step (Prediction) ---
-            # Student predicts noise
-            predicted_noise = student(noisy_images.squeeze(1), timesteps.squeeze(1), prompt_embeds=None)
-
-            # In a real scenario, we would compare predicted_noise to the Teacher's predicted_noise
-            # For this scaffold, we ensure the shapes match.
-            if predicted_noise.shape != noise.shape:
-                print(f"Warning: Shape mismatch. Student: {predicted_noise.shape}, Target: {noise.shape}")
-
-            # Loss Function (MSE)
-            loss = F.mse_loss(predicted_noise, noise)
-
+            # --- BACKPROPAGATION ---
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             global_step += 1
 
-            if global_step % 100 == 0:
-                print(f"Step {global_step}, Loss: {loss.item():.6f}")
+            if global_step % 50 == 0:
+                print(f"Step {global_step}: Loss = {loss.item()}")
 
-    # Save Student
-    save_path = os.path.join(args.output_dir, "distilled_model.pth")
-    torch.save(student.state_dict(), save_path)
-    print(f"Training complete. Model saved to {save_path}")
+    # 8. Save Model
+    student_model.save_pretrained(args.output_dir)
+    print("Training complete.")
 
 
 if __name__ == "__main__":
