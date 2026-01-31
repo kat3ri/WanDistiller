@@ -85,23 +85,33 @@ class TestFullPipeline(unittest.TestCase):
         mock_device.return_value = "cpu"
 
         # Mock Teacher Pipeline
-        mock_diffusion.return_value = MagicMock(transformer=MagicMock())
+        mock_teacher_pipe = MagicMock()
+        # Mock transformer to return tensor when called
+        mock_teacher_output = real_torch.randn(2, 4, 64, 64)  # batch_size=2, num_channels=4, 64x64
+        mock_teacher_pipe.transformer = MagicMock(return_value=mock_teacher_output)
+        mock_teacher_pipe.transformer.eval = MagicMock()
+        # Mock to() method to return self
+        mock_teacher_pipe.to = MagicMock(return_value=mock_teacher_pipe)
+        # Mock encode_prompt to return text embeddings
+        mock_text_emb = real_torch.randn(2, 4096)  # batch_size=2, text_encoder_output_dim=4096
+        mock_teacher_pipe.encode_prompt = MagicMock(return_value=(mock_text_emb,))
+        mock_diffusion.from_pretrained = MagicMock(return_value=mock_teacher_pipe)
 
         # Mock Dataset
         mock_dataset_instance = MagicMock()
-        mock_dataset_instance.__len__ = MagicMock(return_value=1)
-        # Create a mock text embedding tensor
-        mock_text_emb = real_torch.randn(2, 4096)  # batch_size=2, text_encoder_output_dim=4096
-        mock_batch = {'text_embeddings': mock_text_emb}
-        mock_dataset_instance.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_dataset_instance.__len__ = MagicMock(return_value=2)
+        # Dataset should return prompt strings when __getitem__ is called
+        mock_dataset_instance.__getitem__ = MagicMock(side_effect=lambda idx: ["test prompt 1", "test prompt 2"][idx])
         mock_dataset.return_value = mock_dataset_instance
 
         # Mock Student
-        mock_student_instance = MagicMock()
+        mock_param = real_torch.nn.Parameter(real_torch.randn(2, 4, 64, 64))
+        # Create output that has grad_fn by performing an operation on the parameter
+        mock_student_output = mock_param + 0  # This creates a tensor with grad_fn
+        mock_student_instance = MagicMock(return_value=mock_student_output)
         mock_student_instance.train = MagicMock()
         mock_student_instance.save_pretrained = MagicMock()
         # Mock parameters to return a real tensor that can be optimized
-        mock_param = real_torch.nn.Parameter(real_torch.randn(1))
         mock_student_instance.parameters = MagicMock(return_value=[mock_param])
         # Mock to() method to return self
         mock_student_instance.to = MagicMock(return_value=mock_student_instance)
@@ -122,11 +132,12 @@ class TestFullPipeline(unittest.TestCase):
         train_distillation.main()
 
         # Assertions
-        # 1. Verify WanLiteStudent was initialized with config
-        mock_student.assert_called_once_with(self.test_config)
+        # 1. Verify WanLiteStudent was initialized with config and teacher_checkpoint_path
+        mock_student.assert_called_once_with(self.test_config, teacher_checkpoint_path=self.mock_args["teacher_path"])
 
-        # 2. Verify load_and_project_weights was called
-        mock_proj.assert_called_once()
+        # 2. Note: load_and_project_weights is called inside WanLiteStudent.__init__, 
+        # but since we're mocking WanLiteStudent, the real __init__ never runs.
+        # Therefore, we cannot assert that load_and_project_weights was called in this test.
 
         # 3. Verify save_pretrained was called with output_dir
         mock_student_instance.save_pretrained.assert_called_once_with(self.mock_args["output_dir"])
