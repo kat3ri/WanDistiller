@@ -64,14 +64,13 @@ class TestFullPipeline(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     @patch('torch.device')
-    @patch('torch.randn')
     # UPDATE: Patch the specific class from train_distillation
     @patch('train_distillation.WanLiteStudent')
     @patch('train_distillation.DiffusionPipeline')  # Mock the teacher loading
     @patch('train_distillation.StaticPromptsDataset')
     # UPDATE: Patch load_and_project_weights based on your projection_mapper.py
     @patch('train_distillation.load_and_project_weights')
-    def test_main_integration(self, mock_proj, mock_dataset, mock_diffusion, mock_student, mock_randn, mock_device):
+    def test_main_integration(self, mock_proj, mock_dataset, mock_diffusion, mock_student, mock_device):
         """
         This test ensures that:
         1. load_config is called.
@@ -79,10 +78,11 @@ class TestFullPipeline(unittest.TestCase):
         3. load_and_project_weights is called.
         4. StaticPromptsDataset is used.
         """
-
+        # Import torch before setting up mocks that need it
+        import torch as real_torch
+        
         # Mock return values
         mock_device.return_value = "cpu"
-        mock_randn.return_value = "mock_latents_tensor"
 
         # Mock Teacher Pipeline
         mock_diffusion.return_value = MagicMock(transformer=MagicMock())
@@ -90,13 +90,21 @@ class TestFullPipeline(unittest.TestCase):
         # Mock Dataset
         mock_dataset_instance = MagicMock()
         mock_dataset_instance.__len__ = MagicMock(return_value=1)
-        mock_batch = {'text_embeddings': 'mock_text'}
-        mock_dataset_instance.__iter__ = MagicMock(return_value=[mock_batch])
+        # Create a mock text embedding tensor
+        mock_text_emb = real_torch.randn(2, 4096)  # batch_size=2, text_encoder_output_dim=4096
+        mock_batch = {'text_embeddings': mock_text_emb}
+        mock_dataset_instance.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_dataset.return_value = mock_dataset_instance
 
         # Mock Student
         mock_student_instance = MagicMock()
         mock_student_instance.train = MagicMock()
         mock_student_instance.save_pretrained = MagicMock()
+        # Mock parameters to return a real tensor that can be optimized
+        mock_param = real_torch.nn.Parameter(real_torch.randn(1))
+        mock_student_instance.parameters = MagicMock(return_value=[mock_param])
+        # Mock to() method to return self
+        mock_student_instance.to = MagicMock(return_value=mock_student_instance)
         mock_student.return_value = mock_student_instance
 
         # Setup sys.argv to match main.py style
@@ -106,7 +114,7 @@ class TestFullPipeline(unittest.TestCase):
             "--student_config", self.mock_args["student_config"],
             "--data_path", self.mock_args["data_path"],
             "--output_dir", self.mock_args["output_dir"],
-            "--batch_size", self.mock_args["batch_size"],
+            "--batch_size", str(self.mock_args["batch_size"]),
             "--lr", str(self.mock_args["lr"])
         ]
 
