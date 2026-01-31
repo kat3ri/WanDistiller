@@ -104,9 +104,12 @@ class WanLiteStudent(nn.Module):
     to the student's 2D image architecture.
     """
 
-    def __init__(self, config, teacher_checkpoint_path=None, device="cuda"):
+    def __init__(self, config, teacher_checkpoint_path=None, device=None):
         super().__init__()
         self.config = config
+        # Default to cuda if available, otherwise cpu
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
         # Extract configuration parameters
@@ -314,12 +317,28 @@ def main():
 
     # 3. Initialize Student Model
     # Initialize with teacher checkpoint path to enable weight projection
-    student_model = WanLiteStudent(student_config, teacher_checkpoint_path=args.teacher_path).to(device)
+    student_model = WanLiteStudent(student_config, teacher_checkpoint_path=args.teacher_path, device=device)
 
     # 4. Initialize Teacher Model (Diffusers)
-    # This loads the model from the path specified in main.py
-    teacher_pipe = DiffusionPipeline.from_pretrained(args.teacher_path)
-    teacher_pipe.to(device)
+    # This loads the model from the path specified
+    print(f"Loading teacher model from: {args.teacher_path}")
+    
+    teacher_pipe = None
+    try:
+        # Try to load from HuggingFace or local cache
+        # Set local_files_only=False to allow Hub download if possible
+        teacher_pipe = DiffusionPipeline.from_pretrained(
+            args.teacher_path,
+            local_files_only=False
+        )
+        teacher_pipe.to(device)
+        print("✓ Loaded real teacher model from HuggingFace")
+    except Exception as e:
+        print(f"⚠️  Could not load real teacher model: {e}")
+        print("   Using mock teacher model for testing...")
+        from mock_teacher import create_mock_teacher_pipeline
+        teacher_pipe = create_mock_teacher_pipeline(args.teacher_path, device=device)
+    
 
     # Wan2.1 models usually have the transformer as a specific attribute
     # Adjust this if your Diffusers model structure is different

@@ -1,0 +1,12 @@
+{
+    "model_type": "WanLiteStudent",
+    "hidden_size": 256,
+    "depth": 4,
+    "num_heads": 4,
+    "num_channels": 4,
+    "image_size": 256,
+    "patch_size": 16,
+    "text_max_length": 77,
+    "text_encoder_output_dim": 4096,
+    "projection_factor": 1.0
+}
