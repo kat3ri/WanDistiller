@@ -230,9 +230,13 @@ python train_distillation.py --batch_size 1
 pip install -r requirements.txt --upgrade
 ```
 
+### UMT5 "encoder.embed_tokens.weight MISSING" Warning
+This warning is **expected and harmless**. The UMT5 text encoder uses weight tying where `encoder.embed_tokens.weight` references `shared.weight`. The weights are correctly loaded - see [docs/UMT5_WEIGHT_LOADING.md](docs/UMT5_WEIGHT_LOADING.md) for details.
+
 ## 📚 Additional Documentation
 
 - [TESTING.md](TESTING.md) - Complete testing guide
+- [docs/UMT5_WEIGHT_LOADING.md](docs/UMT5_WEIGHT_LOADING.md) - Understanding UMT5 text encoder weight warnings
 - [readme.md](readme.md) - Original detailed documentation
 - `config/student_config.json` - Model architecture reference
 

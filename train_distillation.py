@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import warnings
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -329,23 +330,49 @@ def main():
     try:
         # First try local_files_only to avoid network timeout
         print("   Trying local cache first...")
-        teacher_pipe = DiffusionPipeline.from_pretrained(
-            args.teacher_path,
-            local_files_only=True
-        )
+        
+        # Suppress warnings about tied weights in T5/UMT5 models
+        # These warnings are expected and harmless - encoder.embed_tokens.weight
+        # is tied to shared.weight, so the "MISSING" warning is misleading
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
+            warnings.filterwarnings("ignore", message=".*were newly initialized.*")
+            
+            teacher_pipe = DiffusionPipeline.from_pretrained(
+                args.teacher_path,
+                local_files_only=True
+            )
         teacher_pipe.to(device)
         print("✓ Loaded real teacher model from local cache")
+        
+        # Note about UMT5 text encoder
+        if hasattr(teacher_pipe, 'text_encoder'):
+            print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
+            print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
+            
     except Exception as e:
         print(f"   Could not load from local cache: {str(e)[:100]}")
         try:
             # Try with network access (if available)
             print("   Trying to download from HuggingFace Hub...")
-            teacher_pipe = DiffusionPipeline.from_pretrained(
-                args.teacher_path,
-                local_files_only=False
-            )
+            
+            # Suppress warnings about tied weights
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
+                warnings.filterwarnings("ignore", message=".*were newly initialized.*")
+                
+                teacher_pipe = DiffusionPipeline.from_pretrained(
+                    args.teacher_path,
+                    local_files_only=False
+                )
             teacher_pipe.to(device)
             print("✓ Loaded real teacher model from HuggingFace")
+            
+            # Note about UMT5 text encoder
+            if hasattr(teacher_pipe, 'text_encoder'):
+                print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
+                print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
+                
         except Exception as e2:
             print(f"   Could not download: {str(e2)[:100]}")
             teacher_pipe = None
