@@ -324,18 +324,35 @@ def main():
     print(f"Loading teacher model from: {args.teacher_path}")
     
     teacher_pipe = None
+    # In environments without network access or when the model is not cached,
+    # we'll use a mock teacher model instead
     try:
-        # Try to load from HuggingFace or local cache
-        # Set local_files_only=False to allow Hub download if possible
+        # First try local_files_only to avoid network timeout
+        print("   Trying local cache first...")
         teacher_pipe = DiffusionPipeline.from_pretrained(
             args.teacher_path,
-            local_files_only=False
+            local_files_only=True
         )
         teacher_pipe.to(device)
-        print("✓ Loaded real teacher model from HuggingFace")
+        print("✓ Loaded real teacher model from local cache")
     except Exception as e:
-        print(f"⚠️  Could not load real teacher model: {e}")
-        print("   Using mock teacher model for testing...")
+        print(f"   Could not load from local cache: {str(e)[:100]}")
+        try:
+            # Try with network access (if available)
+            print("   Trying to download from HuggingFace Hub...")
+            teacher_pipe = DiffusionPipeline.from_pretrained(
+                args.teacher_path,
+                local_files_only=False
+            )
+            teacher_pipe.to(device)
+            print("✓ Loaded real teacher model from HuggingFace")
+        except Exception as e2:
+            print(f"   Could not download: {str(e2)[:100]}")
+            teacher_pipe = None
+    
+    # Fallback to mock teacher if real model couldn't be loaded
+    if teacher_pipe is None:
+        print("⚠️  Using mock teacher model for testing...")
         from mock_teacher import create_mock_teacher_pipeline
         teacher_pipe = create_mock_teacher_pipeline(args.teacher_path, device=device)
     
