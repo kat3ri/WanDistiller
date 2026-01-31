@@ -175,7 +175,13 @@ class WanLiteStudent(nn.Module):
         
         # Create sinusoidal time embeddings
         batch_size = x.shape[0]
-        half_dim = self.config["hidden_size"] // 2
+        hidden_size = self.config["hidden_size"]
+        
+        # Ensure hidden_size is even for proper sin/cos concatenation
+        if hidden_size % 2 != 0:
+            raise ValueError(f"hidden_size must be even for time embeddings, got {hidden_size}")
+        
+        half_dim = hidden_size // 2
         emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
         emb = timestep[:, None] * emb[None, :]
