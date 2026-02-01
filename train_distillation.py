@@ -340,6 +340,8 @@ def main():
             
             # Load the model in its native format without forcing dtype or variant
             # This allows the model to load in whatever format is available
+            # Note: Model will load in full precision (fp32) which requires more GPU memory
+            # but ensures compatibility when fp16 variant is not available
             load_kwargs = {
                 "local_files_only": True,
             }
@@ -371,6 +373,9 @@ def main():
                 warnings.filterwarnings("ignore", message=".*were newly initialized.*")
                 
                 # Load the model in its native format without forcing dtype or variant
+                # This allows the model to load in whatever format is available
+                # Note: Model will load in full precision (fp32) which requires more GPU memory
+                # but ensures compatibility when fp16 variant is not available
                 load_kwargs = {
                     "local_files_only": False,
                 }
