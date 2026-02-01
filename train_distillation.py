@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 import warnings
 import torch
 import torch.nn as nn
@@ -412,7 +413,7 @@ def main():
         print("\nTo cache the model, run:")
         print(f"  python -c \"from diffusers import DiffusionPipeline; DiffusionPipeline.from_pretrained('{args.teacher_path}')\"")
         print("="*80)
-        return
+        sys.exit(1)
     
 
     # Wan2.1 models usually have the transformer as a specific attribute
