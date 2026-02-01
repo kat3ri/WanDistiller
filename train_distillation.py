@@ -562,7 +562,7 @@ def main():
             # --- STUDENT PASS ---
 
             # Use original latents for student (not the projected ones used for teacher)
-            # Student conv_in expects num_channels (4), not teacher's expected channels (16)
+            # Student conv_in expects config['num_channels'], not teacher's in_channels
             student_output = student_model(
                 latent_0=student_latents,
                 latent_1=None,
