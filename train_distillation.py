@@ -666,7 +666,7 @@ def main():
                 if "device_map" not in load_kwargs:
                     print(f"   Moving pipeline to {device}...")
                     teacher_pipe.to(device)
-                elif args.teacher_on_cpu and device != torch.device("cpu"):
+                elif args.teacher_on_cpu and device.type != "cpu":
                     # Teacher is on CPU but student is on GPU - keep teacher on CPU
                     teacher_pipe.to("cpu")
                     print(f"   Teacher model kept on CPU (student on {device})")
@@ -722,7 +722,7 @@ def main():
                     if "device_map" not in load_kwargs:
                         print(f"   Moving pipeline to {device}...")
                         teacher_pipe.to(device)
-                    elif args.teacher_on_cpu and device != torch.device("cpu"):
+                    elif args.teacher_on_cpu and device.type != "cpu":
                         # Teacher is on CPU but student is on GPU - keep teacher on CPU
                         teacher_pipe.to("cpu")
                         print(f"   Teacher model kept on CPU (student on {device})")
@@ -770,9 +770,6 @@ def main():
     teacher_text_encoder = None
     teacher_tokenizer = None
     
-    if teacher_pipe is not None:
-        teacher_model = teacher_pipe.transformer
-        teacher_model.eval()  # Teacher should not be trained
     if teacher_pipe is not None:
         teacher_model = teacher_pipe.transformer
         teacher_model.eval()  # Teacher should not be trained
