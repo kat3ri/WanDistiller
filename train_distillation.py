@@ -496,6 +496,10 @@ def main():
 
             # --- TEACHER PASS ---
 
+            # Save original latents for student (before any projection)
+            # Student expects original num_channels (4), not projected channels
+            student_latents = latents.clone()
+
             with torch.no_grad():
                 # 1. Ensure Latent Shape (B, C, T, H, W)
                 # This assumes your latent shape is currently (B, 4, T, H, W)
@@ -535,7 +539,7 @@ def main():
                     # Move to device (latents.device is now effectively Float32 due to .float() above)
                     proj_layer = proj_layer.to(latents.device)
 
-                    # Apply projection
+                    # Apply projection (only for teacher, not student)
                     latents = proj_layer(latents)
 
                 # 4. Pass through teacher
@@ -554,26 +558,13 @@ def main():
                     teacher_output = teacher_output.get('sample', teacher_output)
                 elif hasattr(teacher_output, 'sample'):
                     teacher_output = teacher_output.sample
-            # --- FIX: Squeeze temporal dimension for Student ---
-            # The student model expects a 4D tensor (B, C, H, W) for conv2d,
-            # but the latent currently has a 5D shape (B, C, T, H, W).
-            # We remove the time dimension (axis 2).
-            if latents.dim() == 5:
-                latents = latents.squeeze(2)
 
             # --- STUDENT PASS ---
 
-            # Ensure latent_0 is 4D (remove time dimension if present)
-            if latents.dim() == 5:
-                latents = latents.squeeze(2)
-
-            # Ensure latent_1 is 4D (remove time dimension if present)
-            # This fixes the error at line 175 where latent_1 is used with conv2d
-#=            if latent_1 is not None and latent_1.dim() == 5:
-#                latent_1 = latent_1.squeeze(2)
-
+            # Use original latents for student (not the projected ones used for teacher)
+            # Student conv_in expects config['num_channels'], not teacher's in_channels
             student_output = student_model(
-                latent_0=latents,
+                latent_0=student_latents,
                 latent_1=None,
                 timestep=timesteps,
                 encoder_hidden_states=text_embeddings,
