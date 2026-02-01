@@ -366,10 +366,22 @@ def main():
                 load_kwargs["variant"] = variant
             
             print(f"   Loading pipeline components (this may take a few minutes)...")
-            teacher_pipe = DiffusionPipeline.from_pretrained(
-                args.teacher_path,
-                **load_kwargs
-            )
+            try:
+                teacher_pipe = DiffusionPipeline.from_pretrained(
+                    args.teacher_path,
+                    **load_kwargs
+                )
+            except (OSError, ValueError) as variant_error:
+                # If fp16 variant is not available, try without variant
+                if variant and "variant" in str(variant_error).lower():
+                    print(f"   fp16 variant not available, trying without variant...")
+                    load_kwargs.pop("variant", None)
+                    teacher_pipe = DiffusionPipeline.from_pretrained(
+                        args.teacher_path,
+                        **load_kwargs
+                    )
+                else:
+                    raise
         
         print(f"   Moving pipeline to {device}...")
         teacher_pipe.to(device)
@@ -412,10 +424,22 @@ def main():
                     load_kwargs["variant"] = variant
                 
                 print(f"   Loading pipeline components (this may take a few minutes)...")
-                teacher_pipe = DiffusionPipeline.from_pretrained(
-                    args.teacher_path,
-                    **load_kwargs
-                )
+                try:
+                    teacher_pipe = DiffusionPipeline.from_pretrained(
+                        args.teacher_path,
+                        **load_kwargs
+                    )
+                except (OSError, ValueError) as variant_error:
+                    # If fp16 variant is not available, try without variant
+                    if variant and "variant" in str(variant_error).lower():
+                        print(f"   fp16 variant not available, trying without variant...")
+                        load_kwargs.pop("variant", None)
+                        teacher_pipe = DiffusionPipeline.from_pretrained(
+                            args.teacher_path,
+                            **load_kwargs
+                        )
+                    else:
+                        raise
             
             print(f"   Moving pipeline to {device}...")
             teacher_pipe.to(device)
