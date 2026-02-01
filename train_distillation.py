@@ -13,7 +13,6 @@ from safetensors.torch import save_file
 from projection_mapper import load_and_project_weights
 
 
-
 # -----------------------------------------------------------------------------
 # Dataset Configuration
 # -----------------------------------------------------------------------------
@@ -97,11 +96,11 @@ class WanTransformerBlock(nn.Module):
 class WanLiteStudent(nn.Module):
     """
     WanLiteStudent model definition - A 2D image-only model.
-    
+
     This model is designed for static image generation (Text-to-Image),
     not video generation. It receives projected weights from the teacher
     video model (Wan 2.2) but strips out all temporal/motion components.
-    
+
     The projection_mapper handles converting the teacher's 3D video weights
     to the student's 2D image architecture.
     """
@@ -145,7 +144,7 @@ class WanLiteStudent(nn.Module):
 
         # Move to device first
         self.to(device)
-        
+
         # 5. Apply Projection Mapper
         # Loads weights from the teacher checkpoint and maps them to the student architecture
         # This handles converting 3D video model weights to 2D image model weights
@@ -158,13 +157,13 @@ class WanLiteStudent(nn.Module):
     def forward(self, latent_0, latent_1, timestep, encoder_hidden_states):
         """
         Forward pass for 2D image generation (no temporal/video dimensions).
-        
+
         Args:
             latent_0: Input latent tensor (batch, channels, height, width) - 2D spatial only
             latent_1: Optional conditioning latent (batch, channels, height, width) or None
             timestep: Diffusion timestep (batch,)
             encoder_hidden_states: Text embeddings (batch, seq_len, text_dim)
-        
+
         Returns:
             Output prediction (batch, channels, height, width) - 2D spatial only
         """
@@ -174,27 +173,29 @@ class WanLiteStudent(nn.Module):
         # (depending on architecture, latent_1 might be added here or passed into blocks)
         x = self.conv_in(latent_0)
         if latent_1 is not None:
-            x = x + self.conv_in(latent_1)
+            x = x + latent_1
+            if latent_1 is not None and latent_1.dim() == 5:
+                latent_1 = latent_1.squeeze(2)
 
         # 2. Time Embedding
         # Convert timestep to float and create sinusoidal embeddings
         if timestep.dtype != torch.float32:
             timestep = timestep.float()
-        
+
         # Create sinusoidal time embeddings
         batch_size = x.shape[0]
         hidden_size = self.config["hidden_size"]
-        
+
         # Ensure hidden_size is even for proper sin/cos concatenation
         if hidden_size % 2 != 0:
             raise ValueError(f"hidden_size must be even for time embeddings, got {hidden_size}")
-        
+
         half_dim = hidden_size // 2
         emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
         emb = timestep[:, None] * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-        
+
         t_emb = self.time_embed(emb)
 
         # 3. Text Embedding Projection
@@ -205,11 +206,11 @@ class WanLiteStudent(nn.Module):
         # Reshape x for transformer: (batch, channels, h, w) -> (batch, h*w, channels)
         batch, channels, h, w = x.shape
         x = x.flatten(2).transpose(1, 2)  # (batch, h*w, channels)
-        
+
         # We must pass t_emb and text_emb to every block now
         for block in self.blocks:
             x = block(x, t_emb, text_emb)
-        
+
         # Reshape back: (batch, h*w, channels) -> (batch, channels, h, w)
         x = x.transpose(1, 2).reshape(batch, channels, h, w)
 
@@ -250,8 +251,6 @@ class WanLiteStudent(nn.Module):
         print(f"Model saved successfully to: {output_dir}")
 
 
-
-
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
@@ -290,6 +289,7 @@ def load_config(json_path):
         print(f"Error: Config file contains invalid JSON syntax.")
         return None
 
+
 # -----------------------------------------------------------------------------
 # Main Training Logic
 # -----------------------------------------------------------------------------
@@ -324,21 +324,21 @@ def main():
     # 4. Initialize Teacher Model (Diffusers)
     # This loads the model from the path specified
     print(f"Loading teacher model from: {args.teacher_path}")
-    
+
     teacher_pipe = None
     # In environments without network access or when the model is not cached,
     # we'll use a mock teacher model instead
     try:
         # First try local_files_only to avoid network timeout
         print("   Trying local cache first...")
-        
+
         # Suppress warnings about tied weights in T5/UMT5 models
         # These warnings are expected and harmless - encoder.embed_tokens.weight
         # is tied to shared.weight, so the "MISSING" warning is misleading
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
             warnings.filterwarnings("ignore", message=".*were newly initialized.*")
-            
+
             # Load the model in its native format without forcing dtype or variant
             # This allows the model to load in whatever format is available
             # Note: Model will load in full precision (fp32) which requires more GPU memory
@@ -346,33 +346,33 @@ def main():
             load_kwargs = {
                 "local_files_only": True,
             }
-            
+
             print(f"   Loading pipeline components (this may take a few minutes)...")
             teacher_pipe = DiffusionPipeline.from_pretrained(
                 args.teacher_path,
                 **load_kwargs
             )
-        
+
         print(f"   Moving pipeline to {device}...")
         teacher_pipe.to(device)
         print("✓ Loaded real teacher model from local cache")
-        
+
         # Note about UMT5 text encoder
         if hasattr(teacher_pipe, 'text_encoder'):
             print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
             print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
-            
+
     except Exception as e:
         print(f"   Could not load from local cache: {str(e)[:100]}")
         try:
             # Try with network access (if available)
             print("   Trying to download from HuggingFace Hub...")
-            
+
             # Suppress warnings about tied weights
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
                 warnings.filterwarnings("ignore", message=".*were newly initialized.*")
-                
+
                 # Load the model in its native format without forcing dtype or variant
                 # This allows the model to load in whatever format is available
                 # Note: Model will load in full precision (fp32) which requires more GPU memory
@@ -380,31 +380,31 @@ def main():
                 load_kwargs = {
                     "local_files_only": False,
                 }
-                
+
                 print(f"   Loading pipeline components (this may take a few minutes)...")
                 teacher_pipe = DiffusionPipeline.from_pretrained(
                     args.teacher_path,
                     **load_kwargs
                 )
-            
+
             print(f"   Moving pipeline to {device}...")
             teacher_pipe.to(device)
             print("✓ Loaded real teacher model from HuggingFace")
-            
+
             # Note about UMT5 text encoder
             if hasattr(teacher_pipe, 'text_encoder'):
                 print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
                 print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
-                
+
         except Exception as e2:
             print(f"   Could not download: {str(e2)[:100]}")
             teacher_pipe = None
-    
+
     # Exit with error if real model couldn't be loaded
     if teacher_pipe is None:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("ERROR: Failed to load teacher model")
-        print("="*80)
+        print("=" * 80)
         print(f"Model path: {args.teacher_path}")
         print("\nThe teacher model must be available to run distillation training.")
         print("Please ensure:")
@@ -413,14 +413,25 @@ def main():
         print("\nTo cache the model locally, you can download it using:")
         print("  from diffusers import DiffusionPipeline")
         print(f"  DiffusionPipeline.from_pretrained('{args.teacher_path}')")
-        print("="*80)
+        print("=" * 80)
         sys.exit(1)
-    
 
     # Wan2.1 models usually have the transformer as a specific attribute
     # Adjust this if your Diffusers model structure is different
     teacher_model = teacher_pipe.transformer
     teacher_model.eval()  # Teacher should not be trained
+    # Add this inside your main loop or initialization
+    print("--- Teacher Model Config ---")
+    print(f"Expected in_channels (config): {teacher_model.config.get('in_channels', 'Not found')}")
+
+    # Look for projection layers
+    print(f"Has proj_in: {hasattr(teacher_model, 'proj_in')}")
+    if hasattr(teacher_model, 'proj_in'):
+        print(f"Proj in shape: {teacher_model.proj_in.weight.shape}")
+
+    print(f"Has patch_embedding: {hasattr(teacher_model, 'patch_embedding')}")
+    if hasattr(teacher_model, 'patch_embedding'):
+        print(f"Patch embedding shape: {teacher_model.patch_embedding.weight.shape}")
 
     # 5. Initialize Dataset and Dataloader
     dataset = StaticPromptsDataset(args.data_path)
@@ -442,16 +453,16 @@ def main():
             # --- DATA PREPARATION ---
             # batch is a list of prompt strings
             prompts = batch
-            
+
             # Encode the prompts using the teacher's text encoder
             # For Diffusers models, text encoding is usually done via encode_prompt or similar
             # We'll use a simple approach assuming teacher_pipe has text_encoder
             if hasattr(teacher_pipe, 'encode_prompt'):
                 # Use encode_prompt if available
                 text_embeddings = teacher_pipe.encode_prompt(
-                    prompts, 
+                    prompts,
                     device=device,
-                    num_images_per_prompt=1,
+                    # num_images_per_prompt=1,
                     do_classifier_free_guidance=False
                 )[0]
             elif hasattr(teacher_pipe, 'text_encoder'):
@@ -484,22 +495,83 @@ def main():
             timesteps = torch.randint(0, 1000, (args.batch_size,), device=device).long()
 
             # --- TEACHER PASS ---
+
             with torch.no_grad():
-                # Pass through teacher
+                # 1. Ensure Latent Shape (B, C, T, H, W)
+                # This assumes your latent shape is currently (B, 4, T, H, W)
+                if latents.dim() == 4:
+                    latents = latents.unsqueeze(2)
+
+                current_channels = latents.shape[1]
+
+                # 2. Extract Expected Channels from Config
+                # Based on your printout: Expected in_channels (config): 16
+                expected_channels = teacher_model.config.get('in_channels', 4)
+
+                # This handles the mismatch between the model's expectation and the device dtype
+                latents = latents.float()
+                text_embeddings = text_embeddings.float()
+
+                # 3. Inject Projection Layer if Mismatch Exists
+                if current_channels != expected_channels:
+                    print(f"Projection needed: {current_channels} -> {expected_channels}")
+
+                    # Define a Conv3d projection layer
+                    proj_layer = nn.Conv3d(
+                        in_channels=current_channels,
+                        out_channels=expected_channels,
+                        kernel_size=1
+                    )
+
+                    # Initialize weights to 0
+                    nn.init.zeros_(proj_layer.weight)
+                    if proj_layer.bias is not None:
+                        nn.init.zeros_(proj_layer.bias)
+
+                    # --- FIX ---
+                    # Cast the projection layer to Float32 explicitly
+                    proj_layer = proj_layer.float()
+
+                    # Move to device (latents.device is now effectively Float32 due to .float() above)
+                    proj_layer = proj_layer.to(latents.device)
+
+                    # Apply projection
+                    latents = proj_layer(latents)
+
+                # 4. Pass through teacher
+                # Cast timesteps to float32 to satisfy Linear layer requirements
                 teacher_output = teacher_model(
-                    sample=latents,
-                    timestep=timesteps,
+                    hidden_states=latents,
+                    timestep=timesteps.float(),  # <--- Ensure timestep is also float32
                     encoder_hidden_states=text_embeddings,
                 )
-                
+
+                # ... (Extract output logic) ...
+
                 # Extract the actual tensor from teacher output
                 # Diffusers models often return a dict or object with .sample attribute
                 if isinstance(teacher_output, dict):
                     teacher_output = teacher_output.get('sample', teacher_output)
                 elif hasattr(teacher_output, 'sample'):
                     teacher_output = teacher_output.sample
+            # --- FIX: Squeeze temporal dimension for Student ---
+            # The student model expects a 4D tensor (B, C, H, W) for conv2d,
+            # but the latent currently has a 5D shape (B, C, T, H, W).
+            # We remove the time dimension (axis 2).
+            if latents.dim() == 5:
+                latents = latents.squeeze(2)
 
             # --- STUDENT PASS ---
+
+            # Ensure latent_0 is 4D (remove time dimension if present)
+            if latents.dim() == 5:
+                latents = latents.squeeze(2)
+
+            # Ensure latent_1 is 4D (remove time dimension if present)
+            # This fixes the error at line 175 where latent_1 is used with conv2d
+#=            if latent_1 is not None and latent_1.dim() == 5:
+#                latent_1 = latent_1.squeeze(2)
+
             student_output = student_model(
                 latent_0=latents,
                 latent_1=None,
