@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import shlex
 import sys
 import warnings
 import torch
@@ -411,9 +410,9 @@ def main():
         print("Please ensure:")
         print("  1. The model is downloaded and cached locally, OR")
         print("  2. You have internet access to download from HuggingFace Hub")
-        print("\nTo cache the model, run:")
-        escaped_path = shlex.quote(args.teacher_path)
-        print(f"  python -c 'from diffusers import DiffusionPipeline; DiffusionPipeline.from_pretrained({escaped_path})'")
+        print("\nTo cache the model locally, you can download it using:")
+        print("  from diffusers import DiffusionPipeline")
+        print(f"  DiffusionPipeline.from_pretrained('{args.teacher_path}')")
         print("="*80)
         sys.exit(1)
     
