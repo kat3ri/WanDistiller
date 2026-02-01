@@ -493,6 +493,31 @@ def main():
             print("=" * 80)
             sys.exit(1)
         
+        # IMPORTANT: Require --teacher_on_cpu for distributed training to avoid loading teacher on each GPU
+        if not args.teacher_on_cpu:
+            print("=" * 80)
+            print("WARNING: Distributed training without --teacher_on_cpu")
+            print("=" * 80)
+            print()
+            print("In distributed training, --teacher_on_cpu is STRONGLY RECOMMENDED.")
+            print()
+            print("Current behavior WITHOUT --teacher_on_cpu:")
+            print("  - Only rank 0 loads teacher on GPU")
+            print("  - Other ranks will not have teacher outputs (TRAINING WILL FAIL)")
+            print()
+            print("Solutions:")
+            print("  1. Add --teacher_on_cpu flag (RECOMMENDED):")
+            print("     torchrun --nproc_per_node=N train_distillation.py ... --teacher_on_cpu")
+            print("     This loads teacher on CPU (shared by all ranks), saving GPU memory")
+            print()
+            print("  2. Or reduce to single GPU:")
+            print("     python train_distillation.py ... (no --distributed)")
+            print()
+            print("=" * 80)
+            print("ERROR: Distributed training currently requires --teacher_on_cpu")
+            print("=" * 80)
+            sys.exit(1)
+        
         # Early check for GPU count vs requested processes
         num_gpus = torch.cuda.device_count()
         if 'LOCAL_WORLD_SIZE' in os.environ:
@@ -574,88 +599,44 @@ def main():
 
     # 6. Initialize Teacher Model (Diffusers)
     # This loads the model from the path specified
-    # Only print from main process or if not using distributed training
+    # IMPORTANT: In distributed training, only load teacher on rank 0 to save GPU memory
+    # Unless teacher_on_cpu is set, in which case all ranks can share the CPU copy
     if is_main_process(rank) or not args.distributed:
         print(f"Loading teacher model from: {args.teacher_path}")
         if args.teacher_on_cpu:
             print("   Teacher model will be loaded on CPU to save GPU memory")
+            if args.distributed:
+                print("   All ranks will use the same CPU copy (shared memory)")
+        elif args.distributed:
+            print("   WARNING: In distributed mode, only rank 0 loads teacher on GPU")
+            print("   Other ranks will receive teacher outputs via broadcast")
+            print("   This saves GPU memory (avoids loading full model on each GPU)")
         if args.teacher_dtype != "float32":
             print(f"   Teacher model will use {args.teacher_dtype} to save memory")
 
     teacher_pipe = None
+    # In distributed mode, only rank 0 loads teacher (unless using CPU)
+    # This prevents loading full teacher model on every GPU
+    should_load_teacher = (not args.distributed) or (rank == 0) or args.teacher_on_cpu
+    
     # In environments without network access or when the model is not cached,
     # we'll use a mock teacher model instead
-    try:
-        # First try local_files_only to avoid network timeout
-        if is_main_process(rank):
-            print("   Trying local cache first...")
-
-        # Suppress warnings about tied weights in T5/UMT5 models
-        # These warnings are expected and harmless - encoder.embed_tokens.weight
-        # is tied to shared.weight, so the "MISSING" warning is misleading
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
-            warnings.filterwarnings("ignore", message=".*were newly initialized.*")
-
-            # Memory optimization: Configure teacher model dtype and device
-            load_kwargs = {
-                "local_files_only": True,
-            }
-            
-            # Set dtype for memory optimization
-            if args.teacher_dtype == "float16":
-                load_kwargs["torch_dtype"] = torch.float16
-            elif args.teacher_dtype == "bfloat16":
-                load_kwargs["torch_dtype"] = torch.bfloat16
-            
-            # Set device - load on CPU if requested
-            if args.teacher_on_cpu:
-                # For CPU loading, use low_cpu_mem_usage for efficient memory usage
-                # Don't use device_map as "cpu" is not a valid strategy
-                load_kwargs["low_cpu_mem_usage"] = True
-            elif torch.cuda.is_available():
-                # Load on current GPU device
-                load_kwargs["device_map"] = {"": device}
-
-            if is_main_process(rank):
-                print(f"   Loading pipeline components (this may take a few minutes)...")
-            teacher_pipe = DiffusionPipeline.from_pretrained(
-                args.teacher_path,
-                **load_kwargs
-            )
-
-        # Only move to device if we didn't use device_map or if we're targeting CPU
-        if is_main_process(rank):
-            if "device_map" not in load_kwargs:
-                print(f"   Moving pipeline to {device}...")
-                teacher_pipe.to(device)
-            elif args.teacher_on_cpu and device != torch.device("cpu"):
-                # Teacher is on CPU but student is on GPU - keep teacher on CPU
-                teacher_pipe.to("cpu")
-                print(f"   Teacher model kept on CPU (student on {device})")
-            print("✓ Loaded real teacher model from local cache")
-
-        # Note about UMT5 text encoder
-        if hasattr(teacher_pipe, 'text_encoder') and is_main_process(rank):
-            print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
-            print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
-
-    except Exception as e:
-        if is_main_process(rank):
-            print(f"   Could not load from local cache: {str(e)[:100]}")
+    if should_load_teacher:
         try:
-            # Try with network access (if available)
+            # First try local_files_only to avoid network timeout
             if is_main_process(rank):
-                print("   Trying to download from HuggingFace Hub...")
+                print("   Trying local cache first...")
 
-            # Suppress warnings about tied weights
+            # Suppress warnings about tied weights in T5/UMT5 models
+            # These warnings are expected and harmless - encoder.embed_tokens.weight
+            # is tied to shared.weight, so the "MISSING" warning is misleading
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
                 warnings.filterwarnings("ignore", message=".*were newly initialized.*")
 
                 # Memory optimization: Configure teacher model dtype and device
                 load_kwargs = {
-                    "local_files_only": False,
+                    "local_files_only": True,
                 }
                 
                 # Set dtype for memory optimization
@@ -680,8 +661,8 @@ def main():
                     **load_kwargs
                 )
 
+            # Only move to device if we didn't use device_map or if we're targeting CPU
             if is_main_process(rank):
-                # Only move to device if we didn't use device_map
                 if "device_map" not in load_kwargs:
                     print(f"   Moving pipeline to {device}...")
                     teacher_pipe.to(device)
@@ -689,21 +670,82 @@ def main():
                     # Teacher is on CPU but student is on GPU - keep teacher on CPU
                     teacher_pipe.to("cpu")
                     print(f"   Teacher model kept on CPU (student on {device})")
-                print("✓ Loaded real teacher model from HuggingFace")
-
+                print("✓ Loaded real teacher model from local cache")
 
             # Note about UMT5 text encoder
             if hasattr(teacher_pipe, 'text_encoder') and is_main_process(rank):
                 print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
                 print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
 
-        except Exception as e2:
+        except Exception as e:
             if is_main_process(rank):
-                print(f"   Could not download: {str(e2)[:100]}")
-            teacher_pipe = None
+                print(f"   Could not load from local cache: {str(e)[:100]}")
+            try:
+                # Try with network access (if available)
+                if is_main_process(rank):
+                    print("   Trying to download from HuggingFace Hub...")
 
-    # Exit with error if real model couldn't be loaded
-    if teacher_pipe is None:
+                # Suppress warnings about tied weights
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
+                    warnings.filterwarnings("ignore", message=".*were newly initialized.*")
+
+                    # Memory optimization: Configure teacher model dtype and device
+                    load_kwargs = {
+                        "local_files_only": False,
+                    }
+                    
+                    # Set dtype for memory optimization
+                    if args.teacher_dtype == "float16":
+                        load_kwargs["torch_dtype"] = torch.float16
+                    elif args.teacher_dtype == "bfloat16":
+                        load_kwargs["torch_dtype"] = torch.bfloat16
+                    
+                    # Set device - load on CPU if requested
+                    if args.teacher_on_cpu:
+                        # For CPU loading, use low_cpu_mem_usage for efficient memory usage
+                        # Don't use device_map as "cpu" is not a valid strategy
+                        load_kwargs["low_cpu_mem_usage"] = True
+                    elif torch.cuda.is_available():
+                        # Load on current GPU device
+                        load_kwargs["device_map"] = {"": device}
+
+                    if is_main_process(rank):
+                        print(f"   Loading pipeline components (this may take a few minutes)...")
+                    teacher_pipe = DiffusionPipeline.from_pretrained(
+                        args.teacher_path,
+                        **load_kwargs
+                    )
+
+                if is_main_process(rank):
+                    # Only move to device if we didn't use device_map
+                    if "device_map" not in load_kwargs:
+                        print(f"   Moving pipeline to {device}...")
+                        teacher_pipe.to(device)
+                    elif args.teacher_on_cpu and device != torch.device("cpu"):
+                        # Teacher is on CPU but student is on GPU - keep teacher on CPU
+                        teacher_pipe.to("cpu")
+                        print(f"   Teacher model kept on CPU (student on {device})")
+                    print("✓ Loaded real teacher model from HuggingFace")
+
+
+                # Note about UMT5 text encoder
+                if hasattr(teacher_pipe, 'text_encoder') and is_main_process(rank):
+                    print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
+                    print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
+
+            except Exception as e2:
+                if is_main_process(rank):
+                    print(f"   Could not download: {str(e2)[:100]}")
+                teacher_pipe = None
+    else:
+        # Ranks that don't load teacher
+        if is_main_process(rank):
+            print(f"[Rank {rank}] Skipping teacher load - will receive outputs from rank 0")
+        teacher_pipe = None
+
+    # Exit with error if real model couldn't be loaded (but only check on ranks that should load it)
+    if teacher_pipe is None and should_load_teacher:
         if is_main_process(rank):
             print("\n" + "=" * 80)
             print("ERROR: Failed to load teacher model")
@@ -723,49 +765,51 @@ def main():
 
     # Wan2.1 models usually have the transformer as a specific attribute
     # Adjust this if your Diffusers model structure is different
-    teacher_model = teacher_pipe.transformer
-    teacher_model.eval()  # Teacher should not be trained
-    
-    # MEMORY OPTIMIZATION: Delete unused pipeline components to free GPU memory
-    # The pipeline contains text_encoder, vae, scheduler, and other components
-    # that consume significant memory but are not used during training
-    # MEMORY OPTIMIZATION: Keep references to needed components and delete unused ones
-    # Initialize variables to None to ensure they always exist
+    # In distributed mode, only the rank(s) that loaded teacher_pipe will have teacher_model
+    teacher_model = None
     teacher_text_encoder = None
     teacher_tokenizer = None
     
-    if hasattr(teacher_pipe, 'text_encoder'):
-        # Keep reference to text encoder for prompt encoding
-        teacher_text_encoder = teacher_pipe.text_encoder
-        teacher_tokenizer = teacher_pipe.tokenizer if hasattr(teacher_pipe, 'tokenizer') else None
-    
-    # Delete heavy components we don't need
-    if hasattr(teacher_pipe, 'vae'):
-        del teacher_pipe.vae
-    if hasattr(teacher_pipe, 'scheduler'):
-        del teacher_pipe.scheduler
-    # Clear CUDA cache after freeing memory
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    if is_main_process(rank):
-        print("✓ Cleaned up unused teacher pipeline components")
+    if teacher_pipe is not None:
+        teacher_model = teacher_pipe.transformer
+        teacher_model.eval()  # Teacher should not be trained
+    if teacher_pipe is not None:
+        teacher_model = teacher_pipe.transformer
+        teacher_model.eval()  # Teacher should not be trained
+        
+        # MEMORY OPTIMIZATION: Keep references to needed components and delete unused ones
+        if hasattr(teacher_pipe, 'text_encoder'):
+            # Keep reference to text encoder for prompt encoding
+            teacher_text_encoder = teacher_pipe.text_encoder
+            teacher_tokenizer = teacher_pipe.tokenizer if hasattr(teacher_pipe, 'tokenizer') else None
+        
+        # Delete heavy components we don't need
+        if hasattr(teacher_pipe, 'vae'):
+            del teacher_pipe.vae
+        if hasattr(teacher_pipe, 'scheduler'):
+            del teacher_pipe.scheduler
+        # Clear CUDA cache after freeing memory
         if torch.cuda.is_available():
-            print_gpu_memory_summary(rank, "After teacher cleanup")
-    
-    # Add this inside your main loop or initialization
-    if is_main_process(rank):
-        print("--- Teacher Model Config ---")
-        print(f"Expected in_channels (config): {teacher_model.config.get('in_channels', 'Not found')}")
+            torch.cuda.empty_cache()
+        
+        if is_main_process(rank):
+            print("✓ Cleaned up unused teacher pipeline components")
+            if torch.cuda.is_available():
+                print_gpu_memory_summary(rank, "After teacher cleanup")
+        
+        # Print teacher model config
+        if is_main_process(rank):
+            print("--- Teacher Model Config ---")
+            print(f"Expected in_channels (config): {teacher_model.config.get('in_channels', 'Not found')}")
 
-        # Look for projection layers
-        print(f"Has proj_in: {hasattr(teacher_model, 'proj_in')}")
-        if hasattr(teacher_model, 'proj_in'):
-            print(f"Proj in shape: {teacher_model.proj_in.weight.shape}")
+            # Look for projection layers
+            print(f"Has proj_in: {hasattr(teacher_model, 'proj_in')}")
+            if hasattr(teacher_model, 'proj_in'):
+                print(f"Proj in shape: {teacher_model.proj_in.weight.shape}")
 
-        print(f"Has patch_embedding: {hasattr(teacher_model, 'patch_embedding')}")
-        if hasattr(teacher_model, 'patch_embedding'):
-            print(f"Patch embedding shape: {teacher_model.patch_embedding.weight.shape}")
+            print(f"Has patch_embedding: {hasattr(teacher_model, 'patch_embedding')}")
+            if hasattr(teacher_model, 'patch_embedding'):
+                print(f"Patch embedding shape: {teacher_model.patch_embedding.weight.shape}")
 
     # 7. Initialize Dataset and Dataloader
     dataset = StaticPromptsDataset(args.data_path)
@@ -794,37 +838,46 @@ def main():
     
     # MEMORY OPTIMIZATION: Pre-create projection layer if needed
     # This avoids recreating it every batch which causes memory leaks
+    # Only create on ranks that have the teacher model
     proj_layer = None
-    expected_channels = teacher_model.config.get('in_channels', 4)
-    student_channels = student_config["num_channels"]
+    teacher_device = None
+    teacher_dtype = None
     
-    if student_channels != expected_channels:
-        if is_main_process(rank):
-            print(f"Creating projection layer: {student_channels} -> {expected_channels} channels")
-        proj_layer = nn.Conv3d(
-            in_channels=student_channels,
-            out_channels=expected_channels,
-            kernel_size=1
-        )
-        # Initialize weights to zeros
-        nn.init.zeros_(proj_layer.weight)
-        if proj_layer.bias is not None:
-            nn.init.zeros_(proj_layer.bias)
+    if teacher_model is not None:
+        expected_channels = teacher_model.config.get('in_channels', 4)
+        student_channels = student_config["num_channels"]
         
-        # Move to teacher device/dtype and freeze parameters
+        if student_channels != expected_channels:
+            if is_main_process(rank):
+                print(f"Creating projection layer: {student_channels} -> {expected_channels} channels")
+            proj_layer = nn.Conv3d(
+                in_channels=student_channels,
+                out_channels=expected_channels,
+                kernel_size=1
+            )
+            # Initialize weights to zeros
+            nn.init.zeros_(proj_layer.weight)
+            if proj_layer.bias is not None:
+                nn.init.zeros_(proj_layer.bias)
+            
+            # Move to teacher device/dtype and freeze parameters
+            teacher_device = next(teacher_model.parameters()).device
+            teacher_dtype = next(teacher_model.parameters()).dtype
+            proj_layer = proj_layer.to(device=teacher_device, dtype=teacher_dtype)
+            for param in proj_layer.parameters():
+                param.requires_grad = False
+            if is_main_process(rank):
+                print(f"✓ Projection layer created on {teacher_device} with dtype {teacher_dtype}")
+        
+        # Cache teacher device and dtype to avoid repeated parameter iteration
         teacher_device = next(teacher_model.parameters()).device
         teacher_dtype = next(teacher_model.parameters()).dtype
-        proj_layer = proj_layer.to(device=teacher_device, dtype=teacher_dtype)
-        for param in proj_layer.parameters():
-            param.requires_grad = False
         if is_main_process(rank):
-            print(f"✓ Projection layer created on {teacher_device} with dtype {teacher_dtype}")
-    
-    # Cache teacher device and dtype to avoid repeated parameter iteration
-    teacher_device = next(teacher_model.parameters()).device
-    teacher_dtype = next(teacher_model.parameters()).dtype
-    if is_main_process(rank):
-        print(f"Teacher model device: {teacher_device}, dtype: {teacher_dtype}")
+            print(f"Teacher model device: {teacher_device}, dtype: {teacher_dtype}")
+    else:
+        # Ranks without teacher model - set defaults
+        teacher_device = device
+        teacher_dtype = torch.float32
 
 
     # 9. Training Loop
