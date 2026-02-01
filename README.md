@@ -61,6 +61,7 @@ See [TESTING.md](TESTING.md) for detailed testing documentation.
 Once the test passes, train with actual model weights:
 
 ```bash
+# Single GPU training
 python train_distillation.py \
     --teacher_path "timbrooks/instruct-wan" \
     --student_config "config/student_config.json" \
@@ -69,7 +70,20 @@ python train_distillation.py \
     --num_epochs 100 \
     --batch_size 4 \
     --lr 1e-5
+
+# Multi-GPU training (recommended for faster training)
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_path "timbrooks/instruct-wan" \
+    --student_config "config/student_config.json" \
+    --data_path "data/static_prompts.txt" \
+    --output_dir "./outputs/wan_t2i" \
+    --num_epochs 100 \
+    --batch_size 4 \
+    --lr 1e-5 \
+    --distributed
 ```
+
+See [docs/MULTI_GPU.md](docs/MULTI_GPU.md) for detailed multi-GPU training guide.
 
 ## 📁 Project Structure
 
@@ -79,13 +93,17 @@ WanDistiller/
 ├── TESTING.md                   # Testing documentation
 ├── requirements.txt             # Python dependencies
 ├── run_production_test.py       # Production test script
-├── train_distillation.py        # Main training script
+├── train_distillation.py        # Main training script (supports multi-GPU)
 ├── projection_mapper.py         # 3D-to-2D weight projection
 ├── main.py                      # Simple entry point
 ├── config/
 │   └── student_config.json      # Student model architecture
-└── data/
-    └── static_prompts.txt       # Training prompts (55 samples)
+├── data/
+│   └── static_prompts.txt       # Training prompts (55 samples)
+└── docs/
+    ├── MULTI_GPU.md             # Multi-GPU training guide
+    ├── UMT5_WEIGHT_LOADING.md   # UMT5 weight loading info
+    └── PIPELINE_LOADING.md      # Pipeline loading troubleshooting
 ```
 
 ## 🔑 Key Features
@@ -97,6 +115,14 @@ The student model is **purely spatial (2D)** with:
 - ✅ Optimized for static image generation
 - ✅ Conv2D layers (not Conv3D)
 - ✅ 2D spatial attention only
+
+### Multi-GPU Training Support
+Accelerate your training with multiple GPUs:
+- ✅ **DataParallel** - Simple multi-GPU training on a single machine
+- ✅ **DistributedDataParallel** - Advanced multi-GPU with better performance
+- ✅ Automatic batch distribution across GPUs
+- ✅ Support for multi-machine training
+- ✅ See [docs/MULTI_GPU.md](docs/MULTI_GPU.md) for details
 
 ### Intelligent Weight Projection
 The `projection_mapper.py` handles:
@@ -244,6 +270,7 @@ If the model loading appears to hang at "Loading pipeline components: 83%", this
 ## 📚 Additional Documentation
 
 - [TESTING.md](TESTING.md) - Complete testing guide
+- [docs/MULTI_GPU.md](docs/MULTI_GPU.md) - **Multi-GPU training guide (NEW!)**
 - [docs/UMT5_WEIGHT_LOADING.md](docs/UMT5_WEIGHT_LOADING.md) - Understanding UMT5 text encoder weight warnings
 - [docs/PIPELINE_LOADING.md](docs/PIPELINE_LOADING.md) - Troubleshooting slow pipeline loading
 - [readme.md](readme.md) - Original detailed documentation
