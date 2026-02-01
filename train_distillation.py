@@ -665,6 +665,29 @@ def main():
     # Adjust this if your Diffusers model structure is different
     teacher_model = teacher_pipe.transformer
     teacher_model.eval()  # Teacher should not be trained
+    
+    # MEMORY OPTIMIZATION: Delete unused pipeline components to free GPU memory
+    # The pipeline contains text_encoder, vae, scheduler, and other components
+    # that consume significant memory but are not used during training
+    if hasattr(teacher_pipe, 'text_encoder'):
+        # Keep reference to text encoder for prompt encoding
+        teacher_text_encoder = teacher_pipe.text_encoder
+        teacher_tokenizer = teacher_pipe.tokenizer if hasattr(teacher_pipe, 'tokenizer') else None
+    
+    # Delete heavy components we don't need
+    if hasattr(teacher_pipe, 'vae'):
+        del teacher_pipe.vae
+    if hasattr(teacher_pipe, 'scheduler'):
+        del teacher_pipe.scheduler
+    # Clear CUDA cache after freeing memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    if is_main_process(rank):
+        print("✓ Cleaned up unused teacher pipeline components")
+        if torch.cuda.is_available():
+            print_gpu_memory_summary(rank, "After teacher cleanup")
+    
     # Add this inside your main loop or initialization
     if is_main_process(rank):
         print("--- Teacher Model Config ---")
@@ -703,6 +726,29 @@ def main():
     # 8. Optimizer and Loss
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.lr)
     loss_fn = torch.nn.functional.mse_loss
+    
+    # MEMORY OPTIMIZATION: Pre-create projection layer if needed
+    # This avoids recreating it every batch which causes memory leaks
+    proj_layer = None
+    expected_channels = teacher_model.config.get('in_channels', 4)
+    student_channels = student_config["num_channels"]
+    
+    if student_channels != expected_channels:
+        if is_main_process(rank):
+            print(f"Creating projection layer: {student_channels} -> {expected_channels} channels")
+        proj_layer = nn.Conv3d(
+            in_channels=student_channels,
+            out_channels=expected_channels,
+            kernel_size=1
+        )
+        # Initialize weights to zeros
+        nn.init.zeros_(proj_layer.weight)
+        if proj_layer.bias is not None:
+            nn.init.zeros_(proj_layer.bias)
+        
+        proj_layer = proj_layer.float().to(device).eval()
+        if is_main_process(rank):
+            print("✓ Projection layer created and cached")
 
     # 9. Training Loop
     student_model.train()  # Student needs to be in train mode
@@ -727,31 +773,31 @@ def main():
                 prompts = batch
 
                 # Encode the prompts using the teacher's text encoder
-                # For Diffusers models, text encoding is usually done via encode_prompt or similar
-            # We'll use a simple approach assuming teacher_pipe has text_encoder
-            if hasattr(teacher_pipe, 'encode_prompt'):
-                # Use encode_prompt if available
-                text_embeddings = teacher_pipe.encode_prompt(
-                    prompts,
-                    device=device,
-                    # num_images_per_prompt=1,
-                    do_classifier_free_guidance=False
-                )[0]
-            elif hasattr(teacher_pipe, 'text_encoder'):
-                # Fallback to direct text encoder usage
-                if hasattr(teacher_pipe, 'tokenizer'):
-                    text_inputs = teacher_pipe.tokenizer(
+                # Use the saved text encoder reference instead of teacher_pipe
+                if hasattr(teacher_pipe, 'encode_prompt'):
+                    # Use encode_prompt if available
+                    text_embeddings = teacher_pipe.encode_prompt(
                         prompts,
-                        padding="max_length",
-                        max_length=teacher_pipe.tokenizer.model_max_length,
-                        truncation=True,
-                        return_tensors="pt"
-                    ).to(device)
-                    text_embeddings = teacher_pipe.text_encoder(text_inputs.input_ids)[0]
+                        device=device,
+                        # num_images_per_prompt=1,
+                        do_classifier_free_guidance=False
+                    )[0]
+                elif 'teacher_text_encoder' in locals() and teacher_text_encoder is not None:
+                    # Use the saved text encoder directly
+                    if teacher_tokenizer is not None:
+                        text_inputs = teacher_tokenizer(
+                            prompts,
+                            padding="max_length",
+                            max_length=teacher_tokenizer.model_max_length,
+                            truncation=True,
+                            return_tensors="pt"
+                        ).to(device)
+                        with torch.no_grad():
+                            text_embeddings = teacher_text_encoder(text_inputs.input_ids)[0]
+                    else:
+                        raise ValueError("Text encoder found but no tokenizer available")
                 else:
-                    raise ValueError("Text encoder found but no tokenizer available")
-            else:
-                raise ValueError("No text encoder found in teacher pipeline")
+                    raise ValueError("No text encoder found in teacher pipeline")
 
             # Generate random timesteps and latents for the step
             # Shape: [batch_size, 16, 16, 4] (Example based on patch_size=16 and num_channels=4)
@@ -768,61 +814,35 @@ def main():
 
             # --- TEACHER PASS ---
 
-            # Save original latents for student (before any projection)
-            # Student expects original num_channels (4), not projected channels
-            student_latents = latents.clone()
+            # MEMORY OPTIMIZATION: Avoid unnecessary clone
+            # Only keep reference to latents for student use
+            # student_latents will be the original 4D tensor
+            student_latents = latents
 
             with torch.no_grad():
-                # 1. Ensure Latent Shape (B, C, T, H, W)
-                # This assumes your latent shape is currently (B, 4, T, H, W)
-                if latents.dim() == 4:
-                    latents = latents.unsqueeze(2)
+                # 1. Ensure Latent Shape (B, C, T, H, W) for teacher
+                # Create a separate view/copy only if dimension mismatch
+                teacher_latents = latents
+                if teacher_latents.dim() == 4:
+                    teacher_latents = teacher_latents.unsqueeze(2)
 
-                current_channels = latents.shape[1]
+                # MEMORY OPTIMIZATION: Check dtype before conversion to avoid unnecessary copies
+                if teacher_latents.dtype != torch.float32:
+                    teacher_latents = teacher_latents.float()
+                if text_embeddings.dtype != torch.float32:
+                    text_embeddings = text_embeddings.float()
 
-                # 2. Extract Expected Channels from Config
-                # Based on your printout: Expected in_channels (config): 16
-                expected_channels = teacher_model.config.get('in_channels', 4)
+                # 2. Apply pre-created projection layer if needed
+                if proj_layer is not None:
+                    teacher_latents = proj_layer(teacher_latents)
 
-                # This handles the mismatch between the model's expectation and the device dtype
-                latents = latents.float()
-                text_embeddings = text_embeddings.float()
-
-                # 3. Inject Projection Layer if Mismatch Exists
-                if current_channels != expected_channels:
-                    print(f"Projection needed: {current_channels} -> {expected_channels}")
-
-                    # Define a Conv3d projection layer
-                    proj_layer = nn.Conv3d(
-                        in_channels=current_channels,
-                        out_channels=expected_channels,
-                        kernel_size=1
-                    )
-
-                    # Initialize weights to 0
-                    nn.init.zeros_(proj_layer.weight)
-                    if proj_layer.bias is not None:
-                        nn.init.zeros_(proj_layer.bias)
-
-                    # --- FIX ---
-                    # Cast the projection layer to Float32 explicitly
-                    proj_layer = proj_layer.float()
-
-                    # Move to device (latents.device is now effectively Float32 due to .float() above)
-                    proj_layer = proj_layer.to(latents.device)
-
-                    # Apply projection (only for teacher, not student)
-                    latents = proj_layer(latents)
-
-                # 4. Pass through teacher
+                # 3. Pass through teacher
                 # Cast timesteps to float32 to satisfy Linear layer requirements
                 teacher_output = teacher_model(
-                    hidden_states=latents,
-                    timestep=timesteps.float(),  # <--- Ensure timestep is also float32
+                    hidden_states=teacher_latents,
+                    timestep=timesteps.float(),
                     encoder_hidden_states=text_embeddings,
                 )
-
-                # ... (Extract output logic) ...
 
                 # Extract the actual tensor from teacher output
                 # Diffusers models often return a dict or object with .sample attribute
@@ -830,6 +850,12 @@ def main():
                     teacher_output = teacher_output.get('sample', teacher_output)
                 elif hasattr(teacher_output, 'sample'):
                     teacher_output = teacher_output.sample
+                
+                # MEMORY OPTIMIZATION: Explicitly detach teacher output to free computation graph
+                teacher_output = teacher_output.detach()
+                
+                # Free intermediate tensors used only for teacher
+                del teacher_latents
 
             # --- STUDENT PASS ---
 
@@ -847,13 +873,25 @@ def main():
 
             # --- BACKPROPAGATION ---
             optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            loss.backward()
+            optimizer.step()
 
-                global_step += 1
+            global_step += 1
+            
+            # Save loss value before deleting the tensor
+            loss_value = loss.item()
+            
+            # MEMORY OPTIMIZATION: Explicitly delete tensors and clear cache periodically
+            del latents, student_latents, timesteps, text_embeddings, teacher_output, student_output, loss
+            
+            # Clear CUDA cache every 100 steps to prevent memory fragmentation
+            if global_step % 100 == 0:
+                torch.cuda.empty_cache()
 
-                if global_step % 50 == 0 and is_main_process(rank):
-                    print(f"Step {global_step}: Loss = {loss.item()}")
+            if global_step % 50 == 0 and is_main_process(rank):
+                print(f"Step {global_step}: Loss = {loss_value}")
+                if torch.cuda.is_available() and global_step % 200 == 0:
+                    print_gpu_memory_summary(rank, f"Step {global_step}")
             
             except torch.cuda.OutOfMemoryError as e:
                 if is_main_process(rank):
