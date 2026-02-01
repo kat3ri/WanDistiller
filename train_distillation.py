@@ -5,12 +5,58 @@ import sys
 import warnings
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from diffusers import DiffusionPipeline
 from safetensors.torch import save_file
 
 from projection_mapper import load_and_project_weights
+
+
+# -----------------------------------------------------------------------------
+# Multi-GPU / Distributed Training Setup
+# -----------------------------------------------------------------------------
+
+def setup_distributed():
+    """
+    Initialize distributed training process group.
+    Returns rank, world_size, and local_rank.
+    """
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        local_rank = rank % torch.cuda.device_count()
+    else:
+        print("Not using distributed mode")
+        return 0, 1, 0
+    
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    dist.barrier()
+    
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    """
+    Clean up distributed training process group.
+    """
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank):
+    """
+    Check if current process is the main process (rank 0).
+    """
+    return rank == 0
 
 
 # -----------------------------------------------------------------------------
@@ -105,9 +151,10 @@ class WanLiteStudent(nn.Module):
     to the student's 2D image architecture.
     """
 
-    def __init__(self, config, teacher_checkpoint_path=None, device=None):
+    def __init__(self, config, teacher_checkpoint_path=None, device=None, distributed=False):
         super().__init__()
         self.config = config
+        self.distributed = distributed
         # Default to cuda if available, otherwise cpu
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -305,32 +352,79 @@ def main():
     parser.add_argument("--num_steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--num_epochs", type=int, default=10)  # Added this argument
+    
+    # Multi-GPU arguments
+    parser.add_argument("--multi_gpu", action="store_true", 
+                        help="Enable multi-GPU training using DataParallel")
+    parser.add_argument("--distributed", action="store_true",
+                        help="Enable distributed training using DistributedDataParallel (recommended for multi-GPU)")
+    parser.add_argument("--local_rank", type=int, default=0,
+                        help="Local rank for distributed training (set automatically by torch.distributed.launch)")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="Number of data loading workers (default: 0, set to 4+ for better performance)")
 
     args = parser.parse_args()
-
-    # 2. Load Configuration
+    
+    # 2. Setup distributed training if enabled
+    rank = 0
+    world_size = 1
+    local_rank = args.local_rank
+    
+    if args.distributed:
+        rank, world_size, local_rank = setup_distributed()
+        device = torch.device(f"cuda:{local_rank}")
+        print(f"[Rank {rank}] Distributed training initialized: world_size={world_size}, local_rank={local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if args.multi_gpu and torch.cuda.device_count() > 1:
+            print(f"Multi-GPU training enabled with {torch.cuda.device_count()} GPUs using DataParallel")
+        print(f"Using device: {device}")
+    
+    # 3. Load Configuration
     student_config = load_config(args.student_config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Safety check to ensure config loaded successfully
     if student_config is None:
-        print("Error: Could not load student configuration.")
+        if is_main_process(rank):
+            print("Error: Could not load student configuration.")
+        if args.distributed:
+            cleanup_distributed()
         return
 
-    # 3. Initialize Student Model
+    # 4. Initialize Student Model
     # Initialize with teacher checkpoint path to enable weight projection
-    student_model = WanLiteStudent(student_config, teacher_checkpoint_path=args.teacher_path, device=device)
+    student_model = WanLiteStudent(
+        student_config, 
+        teacher_checkpoint_path=args.teacher_path, 
+        device=device,
+        distributed=args.distributed
+    )
+    
+    # Apply multi-GPU wrapper if enabled
+    if args.distributed:
+        # Use DistributedDataParallel for better performance
+        student_model = DDP(student_model, device_ids=[local_rank], output_device=local_rank)
+        if is_main_process(rank):
+            print(f"Model wrapped with DistributedDataParallel on {world_size} GPUs")
+    elif args.multi_gpu and torch.cuda.device_count() > 1:
+        # Use DataParallel for simple multi-GPU
+        student_model = nn.DataParallel(student_model)
+        if is_main_process(rank):
+            print(f"Model wrapped with DataParallel on {torch.cuda.device_count()} GPUs")
 
-    # 4. Initialize Teacher Model (Diffusers)
+    # 5. Initialize Teacher Model (Diffusers)
     # This loads the model from the path specified
-    print(f"Loading teacher model from: {args.teacher_path}")
+    # Only print from main process or if not using distributed training
+    if is_main_process(rank) or not args.distributed:
+        print(f"Loading teacher model from: {args.teacher_path}")
 
     teacher_pipe = None
     # In environments without network access or when the model is not cached,
     # we'll use a mock teacher model instead
     try:
         # First try local_files_only to avoid network timeout
-        print("   Trying local cache first...")
+        if is_main_process(rank):
+            print("   Trying local cache first...")
 
         # Suppress warnings about tied weights in T5/UMT5 models
         # These warnings are expected and harmless - encoder.embed_tokens.weight
@@ -347,26 +441,31 @@ def main():
                 "local_files_only": True,
             }
 
-            print(f"   Loading pipeline components (this may take a few minutes)...")
+            if is_main_process(rank):
+                print(f"   Loading pipeline components (this may take a few minutes)...")
             teacher_pipe = DiffusionPipeline.from_pretrained(
                 args.teacher_path,
                 **load_kwargs
             )
 
-        print(f"   Moving pipeline to {device}...")
+        if is_main_process(rank):
+            print(f"   Moving pipeline to {device}...")
         teacher_pipe.to(device)
-        print("✓ Loaded real teacher model from local cache")
+        if is_main_process(rank):
+            print("✓ Loaded real teacher model from local cache")
 
         # Note about UMT5 text encoder
-        if hasattr(teacher_pipe, 'text_encoder'):
+        if hasattr(teacher_pipe, 'text_encoder') and is_main_process(rank):
             print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
             print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
 
     except Exception as e:
-        print(f"   Could not load from local cache: {str(e)[:100]}")
+        if is_main_process(rank):
+            print(f"   Could not load from local cache: {str(e)[:100]}")
         try:
             # Try with network access (if available)
-            print("   Trying to download from HuggingFace Hub...")
+            if is_main_process(rank):
+                print("   Trying to download from HuggingFace Hub...")
 
             # Suppress warnings about tied weights
             with warnings.catch_warnings():
@@ -381,39 +480,46 @@ def main():
                     "local_files_only": False,
                 }
 
-                print(f"   Loading pipeline components (this may take a few minutes)...")
+                if is_main_process(rank):
+                    print(f"   Loading pipeline components (this may take a few minutes)...")
                 teacher_pipe = DiffusionPipeline.from_pretrained(
                     args.teacher_path,
                     **load_kwargs
                 )
 
-            print(f"   Moving pipeline to {device}...")
+            if is_main_process(rank):
+                print(f"   Moving pipeline to {device}...")
             teacher_pipe.to(device)
-            print("✓ Loaded real teacher model from HuggingFace")
+            if is_main_process(rank):
+                print("✓ Loaded real teacher model from HuggingFace")
 
             # Note about UMT5 text encoder
-            if hasattr(teacher_pipe, 'text_encoder'):
+            if hasattr(teacher_pipe, 'text_encoder') and is_main_process(rank):
                 print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
                 print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
 
         except Exception as e2:
-            print(f"   Could not download: {str(e2)[:100]}")
+            if is_main_process(rank):
+                print(f"   Could not download: {str(e2)[:100]}")
             teacher_pipe = None
 
     # Exit with error if real model couldn't be loaded
     if teacher_pipe is None:
-        print("\n" + "=" * 80)
-        print("ERROR: Failed to load teacher model")
-        print("=" * 80)
-        print(f"Model path: {args.teacher_path}")
-        print("\nThe teacher model must be available to run distillation training.")
-        print("Please ensure:")
-        print("  1. The model is downloaded and cached locally, OR")
-        print("  2. You have internet access to download from HuggingFace Hub")
-        print("\nTo cache the model locally, you can download it using:")
-        print("  from diffusers import DiffusionPipeline")
-        print(f"  DiffusionPipeline.from_pretrained('{args.teacher_path}')")
-        print("=" * 80)
+        if is_main_process(rank):
+            print("\n" + "=" * 80)
+            print("ERROR: Failed to load teacher model")
+            print("=" * 80)
+            print(f"Model path: {args.teacher_path}")
+            print("\nThe teacher model must be available to run distillation training.")
+            print("Please ensure:")
+            print("  1. The model is downloaded and cached locally, OR")
+            print("  2. You have internet access to download from HuggingFace Hub")
+            print("\nTo cache the model locally, you can download it using:")
+            print("  from diffusers import DiffusionPipeline")
+            print(f"  DiffusionPipeline.from_pretrained('{args.teacher_path}')")
+            print("=" * 80)
+        if args.distributed:
+            cleanup_distributed()
         sys.exit(1)
 
     # Wan2.1 models usually have the transformer as a specific attribute
@@ -421,34 +527,57 @@ def main():
     teacher_model = teacher_pipe.transformer
     teacher_model.eval()  # Teacher should not be trained
     # Add this inside your main loop or initialization
-    print("--- Teacher Model Config ---")
-    print(f"Expected in_channels (config): {teacher_model.config.get('in_channels', 'Not found')}")
+    if is_main_process(rank):
+        print("--- Teacher Model Config ---")
+        print(f"Expected in_channels (config): {teacher_model.config.get('in_channels', 'Not found')}")
 
-    # Look for projection layers
-    print(f"Has proj_in: {hasattr(teacher_model, 'proj_in')}")
-    if hasattr(teacher_model, 'proj_in'):
-        print(f"Proj in shape: {teacher_model.proj_in.weight.shape}")
+        # Look for projection layers
+        print(f"Has proj_in: {hasattr(teacher_model, 'proj_in')}")
+        if hasattr(teacher_model, 'proj_in'):
+            print(f"Proj in shape: {teacher_model.proj_in.weight.shape}")
 
-    print(f"Has patch_embedding: {hasattr(teacher_model, 'patch_embedding')}")
-    if hasattr(teacher_model, 'patch_embedding'):
-        print(f"Patch embedding shape: {teacher_model.patch_embedding.weight.shape}")
+        print(f"Has patch_embedding: {hasattr(teacher_model, 'patch_embedding')}")
+        if hasattr(teacher_model, 'patch_embedding'):
+            print(f"Patch embedding shape: {teacher_model.patch_embedding.weight.shape}")
 
-    # 5. Initialize Dataset and Dataloader
+    # 6. Initialize Dataset and Dataloader
     dataset = StaticPromptsDataset(args.data_path)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
+    # Use DistributedSampler for distributed training
+    if args.distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, 
+            batch_size=args.batch_size, 
+            sampler=sampler,
+            num_workers=args.num_workers,  # Configurable number of workers
+            pin_memory=True
+        )
+    else:
+        dataloader = torch.utils.data.DataLoader(
+            dataset, 
+            batch_size=args.batch_size, 
+            shuffle=True,
+            num_workers=args.num_workers  # Configurable number of workers
+        )
 
-    # 6. Optimizer and Loss
+    # 7. Optimizer and Loss
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.lr)
     loss_fn = torch.nn.functional.mse_loss
 
-    # 7. Training Loop
+    # 8. Training Loop
     student_model.train()  # Student needs to be in train mode
     global_step = 0
 
-    print("Starting distillation training...")
+    if is_main_process(rank):
+        print("Starting distillation training...")
 
     # Fixed: Use args.num_epochs
     for epoch in range(args.num_epochs):
+        # Set epoch for DistributedSampler to ensure different shuffling each epoch
+        if args.distributed:
+            sampler.set_epoch(epoch)
+            
         for batch in dataloader:
             # --- DATA PREPARATION ---
             # batch is a list of prompt strings
@@ -580,12 +709,19 @@ def main():
 
             global_step += 1
 
-            if global_step % 50 == 0:
+            if global_step % 50 == 0 and is_main_process(rank):
                 print(f"Step {global_step}: Loss = {loss.item()}")
 
-    # 8. Save Model
-    student_model.save_pretrained(args.output_dir)
-    print("Training complete.")
+    # 9. Save Model (only from main process)
+    if is_main_process(rank):
+        # Unwrap model if using DataParallel or DistributedDataParallel
+        model_to_save = student_model.module if hasattr(student_model, 'module') else student_model
+        model_to_save.save_pretrained(args.output_dir)
+        print("Training complete.")
+    
+    # Clean up distributed training
+    if args.distributed:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
