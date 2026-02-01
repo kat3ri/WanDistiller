@@ -122,6 +122,24 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def print_gpu_memory_summary(rank=0, prefix=""):
+    """
+    Print GPU memory usage summary for debugging OOM issues.
+    """
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / 1024**3  # Convert to GB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # Convert to GB
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # Convert to GB
+        
+        print(f"[Rank {rank}] {prefix} GPU Memory:")
+        print(f"  Allocated: {allocated:.2f} GB")
+        print(f"  Reserved:  {reserved:.2f} GB")
+        print(f"  Max Allocated: {max_allocated:.2f} GB")
+        print(f"  Total: {total:.2f} GB")
+        print(f"  Free: {total - allocated:.2f} GB")
+
+
 def is_main_process(rank):
     """
     Check if current process is the main process (rank 0).
@@ -692,6 +710,9 @@ def main():
 
     if is_main_process(rank):
         print("Starting distillation training...")
+        # Print initial memory usage
+        if torch.cuda.is_available():
+            print_gpu_memory_summary(rank, "Initial")
 
     # Fixed: Use args.num_epochs
     for epoch in range(args.num_epochs):
@@ -700,12 +721,13 @@ def main():
             sampler.set_epoch(epoch)
             
         for batch in dataloader:
-            # --- DATA PREPARATION ---
-            # batch is a list of prompt strings
-            prompts = batch
+            try:
+                # --- DATA PREPARATION ---
+                # batch is a list of prompt strings
+                prompts = batch
 
-            # Encode the prompts using the teacher's text encoder
-            # For Diffusers models, text encoding is usually done via encode_prompt or similar
+                # Encode the prompts using the teacher's text encoder
+                # For Diffusers models, text encoding is usually done via encode_prompt or similar
             # We'll use a simple approach assuming teacher_pipe has text_encoder
             if hasattr(teacher_pipe, 'encode_prompt'):
                 # Use encode_prompt if available
@@ -825,13 +847,54 @@ def main():
 
             # --- BACKPROPAGATION ---
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                loss.backward()
+                optimizer.step()
 
-            global_step += 1
+                global_step += 1
 
-            if global_step % 50 == 0 and is_main_process(rank):
-                print(f"Step {global_step}: Loss = {loss.item()}")
+                if global_step % 50 == 0 and is_main_process(rank):
+                    print(f"Step {global_step}: Loss = {loss.item()}")
+            
+            except torch.cuda.OutOfMemoryError as e:
+                if is_main_process(rank):
+                    print("=" * 80)
+                    print("ERROR: CUDA Out of Memory!")
+                    print("=" * 80)
+                    print()
+                    print_gpu_memory_summary(rank, "Current")
+                    print()
+                    print("The model or batch size is too large for available GPU memory.")
+                    print()
+                    print("Solutions:")
+                    print(f"  1. Reduce batch size (current: {args.batch_size}):")
+                    print(f"     --batch_size {max(1, args.batch_size // 2)}")
+                    print()
+                    print("  2. Reduce model size in config (hidden_size, depth, num_heads)")
+                    print()
+                    print("  3. Enable gradient checkpointing (if implemented)")
+                    print()
+                    print("  4. Use mixed precision training with torch.amp")
+                    print()
+                    print("  5. Set environment variable for better memory management:")
+                    print("     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+                    print()
+                    print("=" * 80)
+                
+                # Clean up before exiting
+                if args.distributed:
+                    cleanup_distributed()
+                sys.exit(1)
+            
+            except Exception as e:
+                if is_main_process(rank):
+                    print(f"ERROR during training step: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Clean up before exiting
+                if args.distributed:
+                    cleanup_distributed()
+                raise
 
     # 10. Save Model (only from main process)
     if is_main_process(rank):

@@ -242,12 +242,38 @@ The `projection_mapper.py` converts teacher weights:
 
 ## 🐛 Troubleshooting
 
-### Out of Memory
+### Out of Memory (OOM) Errors
+
+If you encounter CUDA Out of Memory errors during distributed training:
+
 ```bash
-# Reduce model size in config
-# Or reduce batch size
-python train_distillation.py --batch_size 1
+# 1. Reduce batch size (most effective)
+torchrun --nproc_per_node=2 train_distillation.py \
+    --batch_size 1 \  # Reduce from 2 or 4
+    --distributed \
+    [other args...]
+
+# 2. Use fewer GPUs if memory per GPU is limited
+torchrun --nproc_per_node=1 train_distillation.py \
+    --distributed \
+    [other args...]
+
+# 3. Enable memory-efficient allocation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+torchrun --nproc_per_node=2 train_distillation.py --distributed [other args...]
+
+# 4. Reduce model size in config/student_config.json
+# Edit these parameters:
+# - "hidden_size": 512 (reduce from 1024)
+# - "depth": 8 (reduce from 16)
+# - "image_size": 512 (reduce from 1024)
 ```
+
+**Memory Usage Tips:**
+- Each GPU process loads both teacher and student models
+- Larger batch sizes require more memory
+- Larger image_size increases memory usage quadratically
+- Monitor GPU memory with `nvidia-smi` during training
 
 ### Slow Training
 ```bash
