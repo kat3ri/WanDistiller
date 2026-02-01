@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 import warnings
 import torch
 import torch.nn as nn
@@ -399,11 +400,21 @@ def main():
             print(f"   Could not download: {str(e2)[:100]}")
             teacher_pipe = None
     
-    # Fallback to mock teacher if real model couldn't be loaded
+    # Exit with error if real model couldn't be loaded
     if teacher_pipe is None:
-        print("⚠️  Using mock teacher model for testing...")
-        from mock_teacher import create_mock_teacher_pipeline
-        teacher_pipe = create_mock_teacher_pipeline(args.teacher_path, device=device)
+        print("\n" + "="*80)
+        print("ERROR: Failed to load teacher model")
+        print("="*80)
+        print(f"Model path: {args.teacher_path}")
+        print("\nThe teacher model must be available to run distillation training.")
+        print("Please ensure:")
+        print("  1. The model is downloaded and cached locally, OR")
+        print("  2. You have internet access to download from HuggingFace Hub")
+        print("\nTo cache the model locally, you can download it using:")
+        print("  from diffusers import DiffusionPipeline")
+        print(f"  DiffusionPipeline.from_pretrained('{args.teacher_path}')")
+        print("="*80)
+        sys.exit(1)
     
 
     # Wan2.1 models usually have the transformer as a specific attribute
