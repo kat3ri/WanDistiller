@@ -328,6 +328,16 @@ torchrun --nproc_per_node=2 train_distillation.py --distributed [other args...]
 # Or reduce num_epochs for testing
 ```
 
+### CPU Loading Error: "cpu not supported. Supported strategies are: balanced, cuda"
+
+**This error has been fixed!** If you encounter this error in an older version:
+
+- **Problem:** The code was incorrectly using `device_map="cpu"`, which is not a valid strategy for the Accelerate library
+- **Solution:** Update to the latest version which uses `low_cpu_mem_usage=True` instead
+- **Details:** See [docs/MODEL_LOADING_STRATEGIES.md](docs/MODEL_LOADING_STRATEGIES.md) for all available loading strategies
+
+Valid device_map strategies include: `"auto"`, `"balanced"`, `"sequential"`, or custom dict mappings like `{"": device}`. For CPU loading, use `low_cpu_mem_usage=True` without device_map.
+
 ### Import Errors
 ```bash
 # Reinstall dependencies
@@ -349,6 +359,7 @@ If the model loading appears to hang at "Loading pipeline components: 83%", this
 
 - [TESTING.md](TESTING.md) - Complete testing guide
 - [docs/MULTI_GPU.md](docs/MULTI_GPU.md) - **Multi-GPU training guide (NEW!)**
+- [docs/MODEL_LOADING_STRATEGIES.md](docs/MODEL_LOADING_STRATEGIES.md) - **Model loading strategies: CPU, GPU, sharding, offloading (NEW!)**
 - [docs/UMT5_WEIGHT_LOADING.md](docs/UMT5_WEIGHT_LOADING.md) - Understanding UMT5 text encoder weight warnings
 - [docs/PIPELINE_LOADING.md](docs/PIPELINE_LOADING.md) - Troubleshooting slow pipeline loading
 - [readme.md](readme.md) - Original detailed documentation
