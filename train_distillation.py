@@ -174,7 +174,7 @@ class WanLiteStudent(nn.Module):
         # (depending on architecture, latent_1 might be added here or passed into blocks)
         x = self.conv_in(latent_0)
         if latent_1 is not None:
-            x = x + latent_1
+            x = x + self.conv_in(latent_1)
 
         # 2. Time Embedding
         # Convert timestep to float and create sinusoidal embeddings
