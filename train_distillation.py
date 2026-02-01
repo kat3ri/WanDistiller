@@ -79,8 +79,8 @@ def setup_distributed():
         print(f"ERROR: Invalid GPU configuration!")
         print("=" * 80)
         print()
-        print(f"This process (rank {rank}, local_rank {local_rank}) is trying to use GPU {local_rank},")
-        print(f"but only {num_gpus} GPU(s) are available on this machine (GPU 0 to GPU {num_gpus-1}).")
+        print(f"This process (rank {rank}, local_rank {local_rank}) is trying to use GPU index {local_rank},")
+        print(f"but only {num_gpus} GPU(s) are available on this machine (GPU indices 0 to {num_gpus-1}).")
         print()
         print("This happens when you request more processes than available GPUs.")
         print()
@@ -98,17 +98,16 @@ def setup_distributed():
         sys.exit(1)
     
     # Set the device before initializing the process group
+    # This must be done before init_process_group to ensure proper GPU mapping
     torch.cuda.set_device(local_rank)
     
-    # Initialize process group with explicit device_id to avoid GPU mapping warnings
-    # This ensures each process knows which GPU it should use
-    # device_id should be an integer representing the local rank
+    # Initialize the distributed process group
+    # The NCCL backend will use the device set by torch.cuda.set_device()
     dist.init_process_group(
         backend='nccl', 
         init_method='env://', 
         world_size=world_size, 
-        rank=rank,
-        device_id=local_rank
+        rank=rank
     )
     dist.barrier()
     
