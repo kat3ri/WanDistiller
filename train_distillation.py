@@ -676,7 +676,10 @@ def main():
                 if "device_map" not in load_kwargs:
                     print(f"   Moving pipeline to {device}...")
                     teacher_pipe.to(device)
-                print("✓ Loaded real teacher model from HuggingFace")
+                    print("✓ Loaded real teacher model from HuggingFace")
+                else:
+                    print("✓ Loaded real teacher model from HuggingFace")
+
 
             # Note about UMT5 text encoder
             if hasattr(teacher_pipe, 'text_encoder') and is_main_process(rank):
@@ -805,6 +808,12 @@ def main():
             param.requires_grad = False
         if is_main_process(rank):
             print(f"✓ Projection layer created on {teacher_device} with dtype {teacher_dtype}")
+    
+    # Cache teacher device and dtype to avoid repeated parameter iteration
+    teacher_device = next(teacher_model.parameters()).device
+    teacher_dtype = next(teacher_model.parameters()).dtype
+    if is_main_process(rank):
+        print(f"Teacher model device: {teacher_device}, dtype: {teacher_dtype}")
 
 
     # 9. Training Loop
@@ -884,8 +893,7 @@ def main():
                         teacher_latents = latents
 
                     # MEMORY OPTIMIZATION: Move to teacher device and convert dtype if needed
-                    teacher_device = next(teacher_model.parameters()).device
-                    teacher_dtype = next(teacher_model.parameters()).dtype
+                    # Use cached teacher_device and teacher_dtype from before training loop
                     
                     # Move latents to teacher device (might be CPU)
                     if teacher_latents.device != teacher_device:
@@ -905,13 +913,8 @@ def main():
                         text_embeddings_teacher = text_embeddings_teacher.to(teacher_dtype)
 
                     # 2. Apply pre-created projection layer if needed
-                    # This creates a new tensor, original latents unchanged
+                    # Projection layer was already moved to teacher device/dtype during initialization
                     if proj_layer is not None:
-                        # Move projection layer to teacher device if needed
-                        if proj_layer.weight.device != teacher_device:
-                            proj_layer = proj_layer.to(teacher_device)
-                        if proj_layer.weight.dtype != teacher_dtype:
-                            proj_layer = proj_layer.to(teacher_dtype)
                         teacher_latents = proj_layer(teacher_latents)
 
                     # 3. Pass through teacher
@@ -1019,7 +1022,7 @@ def main():
                 if args.distributed:
                     try:
                         dist.barrier()
-                    except:
+                    except Exception:
                         pass  # Barrier might fail if some processes already crashed
                     cleanup_distributed()
                 
@@ -1036,7 +1039,7 @@ def main():
                 if args.distributed:
                     try:
                         dist.barrier()
-                    except:
+                    except Exception:
                         pass  # Barrier might fail if some processes already crashed
                     cleanup_distributed()
                 
