@@ -462,6 +462,14 @@ def main():
                         help="Number of data loading workers (default: 0, set to 4+ for better performance)")
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing to save memory at the cost of slower training")
+    
+    # Memory optimization arguments
+    parser.add_argument("--teacher_on_cpu", action="store_true",
+                        help="Load teacher model on CPU to save GPU memory (slower but uses less VRAM)")
+    parser.add_argument("--mixed_precision", action="store_true",
+                        help="Use mixed precision (FP16) training to reduce memory usage")
+    parser.add_argument("--teacher_dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"],
+                        help="Data type for teacher model (float16/bfloat16 use less memory)")
 
     args = parser.parse_args()
     
@@ -569,6 +577,10 @@ def main():
     # Only print from main process or if not using distributed training
     if is_main_process(rank) or not args.distributed:
         print(f"Loading teacher model from: {args.teacher_path}")
+        if args.teacher_on_cpu:
+            print("   Teacher model will be loaded on CPU to save GPU memory")
+        if args.teacher_dtype != "float32":
+            print(f"   Teacher model will use {args.teacher_dtype} to save memory")
 
     teacher_pipe = None
     # In environments without network access or when the model is not cached,
@@ -585,13 +597,23 @@ def main():
             warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
             warnings.filterwarnings("ignore", message=".*were newly initialized.*")
 
-            # Load the model in its native format without forcing dtype or variant
-            # This allows the model to load in whatever format is available
-            # Note: Model will load in full precision (fp32) which requires more GPU memory
-            # but ensures compatibility when fp16 variant is not available
+            # Memory optimization: Configure teacher model dtype and device
             load_kwargs = {
                 "local_files_only": True,
             }
+            
+            # Set dtype for memory optimization
+            if args.teacher_dtype == "float16":
+                load_kwargs["torch_dtype"] = torch.float16
+            elif args.teacher_dtype == "bfloat16":
+                load_kwargs["torch_dtype"] = torch.bfloat16
+            
+            # Set device - load on CPU if requested
+            if args.teacher_on_cpu:
+                load_kwargs["device_map"] = "cpu"
+            elif torch.cuda.is_available():
+                # Load on current GPU device
+                load_kwargs["device_map"] = {"": device}
 
             if is_main_process(rank):
                 print(f"   Loading pipeline components (this may take a few minutes)...")
@@ -624,13 +646,23 @@ def main():
                 warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
                 warnings.filterwarnings("ignore", message=".*were newly initialized.*")
 
-                # Load the model in its native format without forcing dtype or variant
-                # This allows the model to load in whatever format is available
-                # Note: Model will load in full precision (fp32) which requires more GPU memory
-                # but ensures compatibility when fp16 variant is not available
+                # Memory optimization: Configure teacher model dtype and device
                 load_kwargs = {
                     "local_files_only": False,
                 }
+                
+                # Set dtype for memory optimization
+                if args.teacher_dtype == "float16":
+                    load_kwargs["torch_dtype"] = torch.float16
+                elif args.teacher_dtype == "bfloat16":
+                    load_kwargs["torch_dtype"] = torch.bfloat16
+                
+                # Set device - load on CPU if requested
+                if args.teacher_on_cpu:
+                    load_kwargs["device_map"] = "cpu"
+                elif torch.cuda.is_available():
+                    # Load on current GPU device
+                    load_kwargs["device_map"] = {"": device}
 
                 if is_main_process(rank):
                     print(f"   Loading pipeline components (this may take a few minutes)...")
@@ -640,10 +672,14 @@ def main():
                 )
 
             if is_main_process(rank):
-                print(f"   Moving pipeline to {device}...")
-            teacher_pipe.to(device)
-            if is_main_process(rank):
-                print("✓ Loaded real teacher model from HuggingFace")
+                # Only move to device if we didn't use device_map
+                if "device_map" not in load_kwargs:
+                    print(f"   Moving pipeline to {device}...")
+                    teacher_pipe.to(device)
+                    print("✓ Loaded real teacher model from HuggingFace")
+                else:
+                    print("✓ Loaded real teacher model from HuggingFace")
+
 
             # Note about UMT5 text encoder
             if hasattr(teacher_pipe, 'text_encoder') and is_main_process(rank):
@@ -764,12 +800,21 @@ def main():
         if proj_layer.bias is not None:
             nn.init.zeros_(proj_layer.bias)
         
-        # Move to device and freeze parameters (no need for eval mode)
-        proj_layer = proj_layer.float().to(device)
+        # Move to teacher device/dtype and freeze parameters
+        teacher_device = next(teacher_model.parameters()).device
+        teacher_dtype = next(teacher_model.parameters()).dtype
+        proj_layer = proj_layer.to(device=teacher_device, dtype=teacher_dtype)
         for param in proj_layer.parameters():
             param.requires_grad = False
         if is_main_process(rank):
-            print("✓ Projection layer created and cached")
+            print(f"✓ Projection layer created on {teacher_device} with dtype {teacher_dtype}")
+    
+    # Cache teacher device and dtype to avoid repeated parameter iteration
+    teacher_device = next(teacher_model.parameters()).device
+    teacher_dtype = next(teacher_model.parameters()).dtype
+    if is_main_process(rank):
+        print(f"Teacher model device: {teacher_device}, dtype: {teacher_dtype}")
+
 
     # 9. Training Loop
     student_model.train()  # Student needs to be in train mode
@@ -847,23 +892,39 @@ def main():
                     else:
                         teacher_latents = latents
 
-                    # MEMORY OPTIMIZATION: Check dtype before conversion to avoid unnecessary copies
-                    if teacher_latents.dtype != torch.float32:
-                        teacher_latents = teacher_latents.float()
-                    if text_embeddings.dtype != torch.float32:
-                        text_embeddings = text_embeddings.float()
+                    # MEMORY OPTIMIZATION: Move to teacher device and convert dtype if needed
+                    # Use cached teacher_device and teacher_dtype from before training loop
+                    
+                    # Move latents to teacher device (might be CPU)
+                    if teacher_latents.device != teacher_device:
+                        teacher_latents = teacher_latents.to(teacher_device)
+                    
+                    # Convert to teacher dtype if needed
+                    if teacher_latents.dtype != teacher_dtype:
+                        teacher_latents = teacher_latents.to(teacher_dtype)
+                    
+                    # Also move text embeddings to teacher device and dtype
+                    if text_embeddings.device != teacher_device:
+                        text_embeddings_teacher = text_embeddings.to(teacher_device)
+                    else:
+                        text_embeddings_teacher = text_embeddings
+                    
+                    if text_embeddings_teacher.dtype != teacher_dtype:
+                        text_embeddings_teacher = text_embeddings_teacher.to(teacher_dtype)
 
                     # 2. Apply pre-created projection layer if needed
-                    # This creates a new tensor, original latents unchanged
+                    # Projection layer was already moved to teacher device/dtype during initialization
                     if proj_layer is not None:
                         teacher_latents = proj_layer(teacher_latents)
 
                     # 3. Pass through teacher
-                    # Cast timesteps to float32 to satisfy Linear layer requirements
+                    # Cast timesteps to teacher device and dtype
+                    timesteps_teacher = timesteps.to(teacher_device).to(teacher_dtype)
+                    
                     teacher_output = teacher_model(
                         hidden_states=teacher_latents,
-                        timestep=timesteps.float(),
-                        encoder_hidden_states=text_embeddings,
+                        timestep=timesteps_teacher,
+                        encoder_hidden_states=text_embeddings_teacher,
                     )
 
                     # Extract the actual tensor from teacher output
@@ -873,11 +934,11 @@ def main():
                     elif hasattr(teacher_output, 'sample'):
                         teacher_output = teacher_output.sample
                     
-                    # MEMORY OPTIMIZATION: Explicitly detach teacher output to free computation graph
-                    teacher_output = teacher_output.detach()
+                    # MEMORY OPTIMIZATION: Move teacher output back to student device and detach
+                    teacher_output = teacher_output.to(device).detach()
                     
                     # Free intermediate tensors used only for teacher
-                    del teacher_latents
+                    del teacher_latents, text_embeddings_teacher, timesteps_teacher
 
                 # --- STUDENT PASS ---
 
@@ -917,45 +978,73 @@ def main():
                         print_gpu_memory_summary(rank, f"Step {global_step}")
             
             except torch.cuda.OutOfMemoryError as e:
-                if is_main_process(rank):
-                    print("=" * 80)
-                    print("ERROR: CUDA Out of Memory!")
-                    print("=" * 80)
-                    print()
+                # Print error message from all ranks to ensure visibility
+                print("=" * 80)
+                print(f"[Rank {rank}] ERROR: CUDA Out of Memory!")
+                print("=" * 80)
+                print()
+                if torch.cuda.is_available():
                     print_gpu_memory_summary(rank, "Current")
                     print()
+                
+                if is_main_process(rank):
                     print("The model or batch size is too large for available GPU memory.")
                     print()
-                    print("Solutions:")
-                    print(f"  1. Reduce batch size (current: {args.batch_size}):")
+                    print("Memory-saving solutions (try in order):")
+                    print(f"  1. Load teacher on CPU (recommended - frees ~120GB GPU memory):")
+                    print(f"     Add --teacher_on_cpu flag")
+                    print()
+                    print(f"  2. Use lower precision for teacher (saves ~50% memory):")
+                    print(f"     Add --teacher_dtype float16 or --teacher_dtype bfloat16")
+                    print()
+                    print(f"  3. Reduce batch size (current: {args.batch_size}):")
                     print(f"     --batch_size {max(1, args.batch_size // 2)}")
                     print()
-                    print("  2. Reduce model size in config (hidden_size, depth, num_heads)")
+                    print("  4. Reduce model size in config/student_config.json:")
+                    print("     - hidden_size: 512 (from 1024)")
+                    print("     - depth: 8 (from 16)")
+                    print("     - image_size: 512 (from 1024)")
                     print()
-                    print("  3. Enable gradient checkpointing (if implemented)")
+                    print("  5. Enable gradient checkpointing:")
+                    print("     Add --gradient_checkpointing flag")
                     print()
-                    print("  4. Use mixed precision training with torch.amp")
-                    print()
-                    print("  5. Set environment variable for better memory management:")
+                    print("  6. Set environment variable for better memory management:")
                     print("     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+                    print()
+                    print("Example command with memory optimizations:")
+                    print("  torchrun --nproc_per_node=1 train_distillation.py \\")
+                    print("    --teacher_on_cpu --teacher_dtype float16 \\")
+                    print("    --batch_size 1 --distributed [other args...]")
                     print()
                     print("=" * 80)
                 
-                # Clean up before exiting
+                # In distributed mode, synchronize all processes before exiting
                 if args.distributed:
+                    try:
+                        dist.barrier()
+                    except Exception:
+                        pass  # Barrier might fail if some processes already crashed
                     cleanup_distributed()
+                
+                # Exit with error code
                 sys.exit(1)
             
             except Exception as e:
-                if is_main_process(rank):
-                    print(f"ERROR during training step: {e}")
-                    import traceback
-                    traceback.print_exc()
+                # Print error from all ranks for visibility in distributed training
+                print(f"[Rank {rank}] ERROR during training step: {e}")
+                import traceback
+                traceback.print_exc()
                 
-                # Clean up before exiting
+                # In distributed mode, synchronize all processes before exiting
                 if args.distributed:
+                    try:
+                        dist.barrier()
+                    except Exception:
+                        pass  # Barrier might fail if some processes already crashed
                     cleanup_distributed()
-                raise
+                
+                # Exit with error code instead of raising to avoid confusing errors
+                sys.exit(1)
 
     # 10. Save Model (only from main process)
     if is_main_process(rank):

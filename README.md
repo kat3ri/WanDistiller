@@ -247,8 +247,30 @@ The `projection_mapper.py` converts teacher weights:
 If you encounter CUDA Out of Memory errors during distributed training:
 
 ```bash
-# 1. Reduce batch size (most effective)
-# Reduce from 2 or 4 to 1
+# RECOMMENDED: Load teacher on CPU (saves ~120GB GPU memory)
+torchrun --nproc_per_node=1 train_distillation.py \
+    --teacher_on_cpu \
+    --batch_size 1 \
+    --distributed \
+    [other args...]
+
+# Alternative: Use lower precision for teacher (saves ~50% memory)
+torchrun --nproc_per_node=1 train_distillation.py \
+    --teacher_dtype float16 \
+    --batch_size 1 \
+    --distributed \
+    [other args...]
+
+# Combine multiple memory optimizations for maximum savings
+torchrun --nproc_per_node=1 train_distillation.py \
+    --teacher_on_cpu \
+    --teacher_dtype float16 \
+    --batch_size 1 \
+    --gradient_checkpointing \
+    --distributed \
+    [other args...]
+
+# 1. Reduce batch size (most effective for student model)
 torchrun --nproc_per_node=2 train_distillation.py \
     --batch_size 1 \
     --distributed \
@@ -277,7 +299,14 @@ torchrun --nproc_per_node=2 train_distillation.py --distributed [other args...]
 # - "image_size": 512 (reduce from 1024)
 ```
 
+**Memory-Saving Options:**
+- `--teacher_on_cpu`: Load teacher model on CPU instead of GPU (saves ~120GB VRAM, slightly slower inference)
+- `--teacher_dtype float16`: Use FP16 for teacher model (saves ~50% memory)
+- `--teacher_dtype bfloat16`: Use BF16 for teacher model (saves ~50% memory, better numerical stability than FP16)
+- `--gradient_checkpointing`: Trade compute for memory in student model
+
 **Memory Usage Tips:**
+- **Teacher model is the biggest memory consumer** (~120GB in FP32)
 - Each GPU process loads both teacher and student models
 - Larger batch sizes require more memory
 - Larger image_size increases memory usage quadratically
@@ -285,6 +314,8 @@ torchrun --nproc_per_node=2 train_distillation.py --distributed [other args...]
 - Monitor GPU memory with `nvidia-smi` during training
 
 **Memory Optimizations Applied:**
+- Optional CPU offloading for teacher model (saves most memory)
+- Optional lower precision (FP16/BF16) for teacher model
 - Automatic cleanup of unused teacher pipeline components (VAE, scheduler)
 - Projection layers are cached instead of recreated each batch
 - Explicit tensor cleanup after each training step
