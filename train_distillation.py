@@ -331,6 +331,23 @@ def main():
         # First try local_files_only to avoid network timeout
         print("   Trying local cache first...")
         
+        # Determine the best dtype and variant for efficient loading
+        # Use float16 on CUDA for faster loading and less memory
+        # Use bfloat16 on CPU if available, otherwise float32
+        if torch.cuda.is_available():
+            load_dtype = torch.float16
+            variant = "fp16"  # Use fp16 variant if available
+            print(f"   Loading with dtype={load_dtype} and variant={variant} for GPU")
+        else:
+            # On CPU, try bfloat16 for better performance, fallback to float32
+            if hasattr(torch, 'bfloat16'):
+                load_dtype = torch.bfloat16
+                print(f"   Loading with dtype={load_dtype} for CPU")
+            else:
+                load_dtype = torch.float32
+                print(f"   Loading with dtype={load_dtype} for CPU")
+            variant = None
+        
         # Suppress warnings about tied weights in T5/UMT5 models
         # These warnings are expected and harmless - encoder.embed_tokens.weight
         # is tied to shared.weight, so the "MISSING" warning is misleading
@@ -338,10 +355,23 @@ def main():
             warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
             warnings.filterwarnings("ignore", message=".*were newly initialized.*")
             
+            # Load with optimized settings
+            # torch_dtype speeds up loading significantly
+            # variant uses pre-converted weights when available
+            load_kwargs = {
+                "local_files_only": True,
+                "torch_dtype": load_dtype,
+            }
+            if variant:
+                load_kwargs["variant"] = variant
+            
+            print(f"   Loading pipeline components (this may take a few minutes)...")
             teacher_pipe = DiffusionPipeline.from_pretrained(
                 args.teacher_path,
-                local_files_only=True
+                **load_kwargs
             )
+        
+        print(f"   Moving pipeline to {device}...")
         teacher_pipe.to(device)
         print("✓ Loaded real teacher model from local cache")
         
@@ -356,15 +386,38 @@ def main():
             # Try with network access (if available)
             print("   Trying to download from HuggingFace Hub...")
             
+            # Determine the best dtype for efficient loading
+            if torch.cuda.is_available():
+                load_dtype = torch.float16
+                variant = "fp16"
+                print(f"   Loading with dtype={load_dtype} and variant={variant} for GPU")
+            else:
+                if hasattr(torch, 'bfloat16'):
+                    load_dtype = torch.bfloat16
+                else:
+                    load_dtype = torch.float32
+                print(f"   Loading with dtype={load_dtype} for CPU")
+                variant = None
+            
             # Suppress warnings about tied weights
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
                 warnings.filterwarnings("ignore", message=".*were newly initialized.*")
                 
+                load_kwargs = {
+                    "local_files_only": False,
+                    "torch_dtype": load_dtype,
+                }
+                if variant:
+                    load_kwargs["variant"] = variant
+                
+                print(f"   Loading pipeline components (this may take a few minutes)...")
                 teacher_pipe = DiffusionPipeline.from_pretrained(
                     args.teacher_path,
-                    local_files_only=False
+                    **load_kwargs
                 )
+            
+            print(f"   Moving pipeline to {device}...")
             teacher_pipe.to(device)
             print("✓ Loaded real teacher model from HuggingFace")
             

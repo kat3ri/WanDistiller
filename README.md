@@ -233,10 +233,19 @@ pip install -r requirements.txt --upgrade
 ### UMT5 "encoder.embed_tokens.weight MISSING" Warning
 This warning is **expected and harmless**. The UMT5 text encoder uses weight tying where `encoder.embed_tokens.weight` references `shared.weight`. The weights are correctly loaded - see [docs/UMT5_WEIGHT_LOADING.md](docs/UMT5_WEIGHT_LOADING.md) for details.
 
+### Pipeline Loading Hangs at 83% (5/6 components)
+If the model loading appears to hang at "Loading pipeline components: 83%", this is usually the VAE or final component loading. The updated code now:
+- Uses optimized dtype (float16 on GPU, bfloat16/float32 on CPU) for faster loading
+- Uses fp16 variant when available on GPU
+- Shows progress messages during loading and device transfer
+
+**If it still takes too long**: The Wan2.2 model is very large (~14B parameters). Loading can take 5-10 minutes on CPU or slower systems. Be patient and wait for the process to complete. See [docs/PIPELINE_LOADING.md](docs/PIPELINE_LOADING.md) for detailed troubleshooting.
+
 ## 📚 Additional Documentation
 
 - [TESTING.md](TESTING.md) - Complete testing guide
 - [docs/UMT5_WEIGHT_LOADING.md](docs/UMT5_WEIGHT_LOADING.md) - Understanding UMT5 text encoder weight warnings
+- [docs/PIPELINE_LOADING.md](docs/PIPELINE_LOADING.md) - Troubleshooting slow pipeline loading
 - [readme.md](readme.md) - Original detailed documentation
 - `config/student_config.json` - Model architecture reference
 
