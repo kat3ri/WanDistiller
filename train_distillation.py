@@ -812,99 +812,99 @@ def main():
                 else:
                     raise ValueError("No text encoder found in teacher pipeline")
 
-            # Generate random timesteps and latents for the step
-            # Shape: [batch_size, 16, 16, 4] (Example based on patch_size=16 and num_channels=4)
-            latents = torch.randn(
-                args.batch_size,
-                student_config["num_channels"],
-                student_config["image_size"] // student_config["patch_size"],
-                student_config["image_size"] // student_config["patch_size"],
-                device=device
-            )
+                # Generate random timesteps and latents for the step
+                # Shape: [batch_size, 16, 16, 4] (Example based on patch_size=16 and num_channels=4)
+                latents = torch.randn(
+                    args.batch_size,
+                    student_config["num_channels"],
+                    student_config["image_size"] // student_config["patch_size"],
+                    student_config["image_size"] // student_config["patch_size"],
+                    device=device
+                )
 
-            # Generate random timesteps
-            timesteps = torch.randint(0, 1000, (args.batch_size,), device=device).long()
+                # Generate random timesteps
+                timesteps = torch.randint(0, 1000, (args.batch_size,), device=device).long()
 
-            # --- TEACHER PASS ---
+                # --- TEACHER PASS ---
 
-            # MEMORY OPTIMIZATION: Avoid unnecessary clone
-            # Only keep reference to latents for student use
-            # student_latents will be the original 4D tensor
-            student_latents = latents
+                # MEMORY OPTIMIZATION: Avoid unnecessary clone
+                # Only keep reference to latents for student use
+                # student_latents will be the original 4D tensor
+                student_latents = latents
 
-            with torch.no_grad():
-                # 1. Ensure Latent Shape (B, C, T, H, W) for teacher
-                # Create a separate view/copy only if dimension mismatch
-                teacher_latents = latents
-                if teacher_latents.dim() == 4:
-                    teacher_latents = teacher_latents.unsqueeze(2)
+                with torch.no_grad():
+                    # 1. Ensure Latent Shape (B, C, T, H, W) for teacher
+                    # Create a separate view/copy only if dimension mismatch
+                    teacher_latents = latents
+                    if teacher_latents.dim() == 4:
+                        teacher_latents = teacher_latents.unsqueeze(2)
 
-                # MEMORY OPTIMIZATION: Check dtype before conversion to avoid unnecessary copies
-                if teacher_latents.dtype != torch.float32:
-                    teacher_latents = teacher_latents.float()
-                if text_embeddings.dtype != torch.float32:
-                    text_embeddings = text_embeddings.float()
+                    # MEMORY OPTIMIZATION: Check dtype before conversion to avoid unnecessary copies
+                    if teacher_latents.dtype != torch.float32:
+                        teacher_latents = teacher_latents.float()
+                    if text_embeddings.dtype != torch.float32:
+                        text_embeddings = text_embeddings.float()
 
-                # 2. Apply pre-created projection layer if needed
-                if proj_layer is not None:
-                    teacher_latents = proj_layer(teacher_latents)
+                    # 2. Apply pre-created projection layer if needed
+                    if proj_layer is not None:
+                        teacher_latents = proj_layer(teacher_latents)
 
-                # 3. Pass through teacher
-                # Cast timesteps to float32 to satisfy Linear layer requirements
-                teacher_output = teacher_model(
-                    hidden_states=teacher_latents,
-                    timestep=timesteps.float(),
+                    # 3. Pass through teacher
+                    # Cast timesteps to float32 to satisfy Linear layer requirements
+                    teacher_output = teacher_model(
+                        hidden_states=teacher_latents,
+                        timestep=timesteps.float(),
+                        encoder_hidden_states=text_embeddings,
+                    )
+
+                    # Extract the actual tensor from teacher output
+                    # Diffusers models often return a dict or object with .sample attribute
+                    if isinstance(teacher_output, dict):
+                        teacher_output = teacher_output.get('sample', teacher_output)
+                    elif hasattr(teacher_output, 'sample'):
+                        teacher_output = teacher_output.sample
+                    
+                    # MEMORY OPTIMIZATION: Explicitly detach teacher output to free computation graph
+                    teacher_output = teacher_output.detach()
+                    
+                    # Free intermediate tensors used only for teacher
+                    del teacher_latents
+
+                # --- STUDENT PASS ---
+
+                # Use original latents for student (not the projected ones used for teacher)
+                # Student conv_in expects config['num_channels'], not teacher's in_channels
+                student_output = student_model(
+                    latent_0=student_latents,
+                    latent_1=None,
+                    timestep=timesteps,
                     encoder_hidden_states=text_embeddings,
                 )
 
-                # Extract the actual tensor from teacher output
-                # Diffusers models often return a dict or object with .sample attribute
-                if isinstance(teacher_output, dict):
-                    teacher_output = teacher_output.get('sample', teacher_output)
-                elif hasattr(teacher_output, 'sample'):
-                    teacher_output = teacher_output.sample
+                # --- LOSS CALCULATION ---
+                loss = loss_fn(student_output, teacher_output)
+
+                # --- BACKPROPAGATION ---
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                global_step += 1
                 
-                # MEMORY OPTIMIZATION: Explicitly detach teacher output to free computation graph
-                teacher_output = teacher_output.detach()
+                # Save loss value before deleting the tensor
+                loss_value = loss.item()
                 
-                # Free intermediate tensors used only for teacher
-                del teacher_latents
+                # MEMORY OPTIMIZATION: Explicitly delete tensors and clear cache periodically
+                del latents, student_latents, timesteps, text_embeddings, teacher_output, student_output, loss
+                
+                # Clear CUDA cache every 100 steps to prevent memory fragmentation
+                if global_step % 100 == 0:
+                    torch.cuda.empty_cache()
 
-            # --- STUDENT PASS ---
-
-            # Use original latents for student (not the projected ones used for teacher)
-            # Student conv_in expects config['num_channels'], not teacher's in_channels
-            student_output = student_model(
-                latent_0=student_latents,
-                latent_1=None,
-                timestep=timesteps,
-                encoder_hidden_states=text_embeddings,
-            )
-
-            # --- LOSS CALCULATION ---
-            loss = loss_fn(student_output, teacher_output)
-
-            # --- BACKPROPAGATION ---
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            global_step += 1
-            
-            # Save loss value before deleting the tensor
-            loss_value = loss.item()
-            
-            # MEMORY OPTIMIZATION: Explicitly delete tensors and clear cache periodically
-            del latents, student_latents, timesteps, text_embeddings, teacher_output, student_output, loss
-            
-            # Clear CUDA cache every 100 steps to prevent memory fragmentation
-            if global_step % 100 == 0:
-                torch.cuda.empty_cache()
-
-            if global_step % 50 == 0 and is_main_process(rank):
-                print(f"Step {global_step}: Loss = {loss_value}")
-                if torch.cuda.is_available() and global_step % 200 == 0:
-                    print_gpu_memory_summary(rank, f"Step {global_step}")
+                if global_step % 50 == 0 and is_main_process(rank):
+                    print(f"Step {global_step}: Loss = {loss_value}")
+                    if torch.cuda.is_available() and global_step % 200 == 0:
+                        print_gpu_memory_summary(rank, f"Step {global_step}")
             
             except torch.cuda.OutOfMemoryError as e:
                 if is_main_process(rank):
