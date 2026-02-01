@@ -682,6 +682,11 @@ def main():
     # MEMORY OPTIMIZATION: Delete unused pipeline components to free GPU memory
     # The pipeline contains text_encoder, vae, scheduler, and other components
     # that consume significant memory but are not used during training
+    # MEMORY OPTIMIZATION: Keep references to needed components and delete unused ones
+    # Initialize variables to None to ensure they always exist
+    teacher_text_encoder = None
+    teacher_tokenizer = None
+    
     if hasattr(teacher_pipe, 'text_encoder'):
         # Keep reference to text encoder for prompt encoding
         teacher_text_encoder = teacher_pipe.text_encoder
@@ -759,7 +764,10 @@ def main():
         if proj_layer.bias is not None:
             nn.init.zeros_(proj_layer.bias)
         
-        proj_layer = proj_layer.float().to(device).eval()
+        # Move to device and freeze parameters (no need for eval mode)
+        proj_layer = proj_layer.float().to(device)
+        for param in proj_layer.parameters():
+            param.requires_grad = False
         if is_main_process(rank):
             print("✓ Projection layer created and cached")
 
@@ -795,7 +803,7 @@ def main():
                         # num_images_per_prompt=1,
                         do_classifier_free_guidance=False
                     )[0]
-                elif 'teacher_text_encoder' in locals() and teacher_text_encoder is not None:
+                elif teacher_text_encoder is not None:
                     # Use the saved text encoder directly
                     if teacher_tokenizer is not None:
                         text_inputs = teacher_tokenizer(
@@ -827,17 +835,17 @@ def main():
 
                 # --- TEACHER PASS ---
 
-                # MEMORY OPTIMIZATION: Avoid unnecessary clone
-                # Only keep reference to latents for student use
-                # student_latents will be the original 4D tensor
-                student_latents = latents
+                # Student will use the original latents directly
+                # For teacher, we need to transform the latents (unsqueeze, projection, etc.)
+                # These operations create new tensors, so student_latents remains unchanged
 
                 with torch.no_grad():
                     # 1. Ensure Latent Shape (B, C, T, H, W) for teacher
-                    # Create a separate view/copy only if dimension mismatch
-                    teacher_latents = latents
-                    if teacher_latents.dim() == 4:
-                        teacher_latents = teacher_latents.unsqueeze(2)
+                    # unsqueeze creates a new tensor, so latents is not modified
+                    if latents.dim() == 4:
+                        teacher_latents = latents.unsqueeze(2)
+                    else:
+                        teacher_latents = latents
 
                     # MEMORY OPTIMIZATION: Check dtype before conversion to avoid unnecessary copies
                     if teacher_latents.dtype != torch.float32:
@@ -846,6 +854,7 @@ def main():
                         text_embeddings = text_embeddings.float()
 
                     # 2. Apply pre-created projection layer if needed
+                    # This creates a new tensor, original latents unchanged
                     if proj_layer is not None:
                         teacher_latents = proj_layer(teacher_latents)
 
@@ -875,7 +884,7 @@ def main():
                 # Use original latents for student (not the projected ones used for teacher)
                 # Student conv_in expects config['num_channels'], not teacher's in_channels
                 student_output = student_model(
-                    latent_0=student_latents,
+                    latent_0=latents,  # Use latents directly, not student_latents reference
                     latent_1=None,
                     timestep=timesteps,
                     encoder_hidden_states=text_embeddings,
@@ -895,7 +904,8 @@ def main():
                 loss_value = loss.item()
                 
                 # MEMORY OPTIMIZATION: Explicitly delete tensors and clear cache periodically
-                del latents, student_latents, timesteps, text_embeddings, teacher_output, student_output, loss
+                # Only delete tensors that still exist in scope
+                del latents, timesteps, text_embeddings, teacher_output, student_output, loss
                 
                 # Clear CUDA cache every 100 steps to prevent memory fragmentation
                 if global_step % 100 == 0:
