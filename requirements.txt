@@ -5,3 +5,4 @@ accelerate>=0.24.0
 safetensors>=0.3.1
 xformers>=0.0.23 # Optional, for memory efficiency
 tqdm>=4.65.0
+ftfy
