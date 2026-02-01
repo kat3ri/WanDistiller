@@ -83,6 +83,12 @@ torchrun --nproc_per_node=4 train_distillation.py \
     --distributed
 ```
 
+> **⚠️ Important:** When using `torchrun`, do NOT include `python` before the script name. 
+> The command `torchrun python train_distillation.py` will fail because `torchrun` already invokes Python internally.
+> 
+> **Correct:** `torchrun --nproc_per_node=4 train_distillation.py ...`  
+> **Wrong:** `torchrun --nproc_per_node=4 python train_distillation.py ...`
+
 See [docs/MULTI_GPU.md](docs/MULTI_GPU.md) for detailed multi-GPU training guide.
 
 ## 📁 Project Structure
@@ -236,12 +242,53 @@ The `projection_mapper.py` converts teacher weights:
 
 ## 🐛 Troubleshooting
 
-### Out of Memory
+### Out of Memory (OOM) Errors
+
+If you encounter CUDA Out of Memory errors during distributed training:
+
 ```bash
-# Reduce model size in config
-# Or reduce batch size
-python train_distillation.py --batch_size 1
+# 1. Reduce batch size (most effective)
+# Reduce from 2 or 4 to 1
+torchrun --nproc_per_node=2 train_distillation.py \
+    --batch_size 1 \
+    --distributed \
+    [other args...]
+
+# 2. Enable gradient checkpointing (trades compute for memory)
+torchrun --nproc_per_node=2 train_distillation.py \
+    --batch_size 2 \
+    --distributed \
+    --gradient_checkpointing \
+    [other args...]
+
+# 3. Use fewer GPUs if memory per GPU is limited
+torchrun --nproc_per_node=1 train_distillation.py \
+    --distributed \
+    [other args...]
+
+# 4. Enable memory-efficient allocation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+torchrun --nproc_per_node=2 train_distillation.py --distributed [other args...]
+
+# 5. Reduce model size in config/student_config.json
+# Edit these parameters:
+# - "hidden_size": 512 (reduce from 1024)
+# - "depth": 8 (reduce from 16)
+# - "image_size": 512 (reduce from 1024)
 ```
+
+**Memory Usage Tips:**
+- Each GPU process loads both teacher and student models
+- Larger batch sizes require more memory
+- Larger image_size increases memory usage quadratically
+- Gradient checkpointing reduces memory by ~40% but slows training by ~20%
+- Monitor GPU memory with `nvidia-smi` during training
+
+**Memory Optimizations Applied:**
+- Automatic cleanup of unused teacher pipeline components (VAE, scheduler)
+- Projection layers are cached instead of recreated each batch
+- Explicit tensor cleanup after each training step
+- CUDA cache cleared periodically to prevent fragmentation
 
 ### Slow Training
 ```bash

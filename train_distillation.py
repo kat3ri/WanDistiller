@@ -17,6 +17,41 @@ from projection_mapper import load_and_project_weights
 
 
 # -----------------------------------------------------------------------------
+# Validation and Error Detection
+# -----------------------------------------------------------------------------
+
+def check_command_line_usage():
+    """
+    Check if the script is being run with common mistakes and provide helpful error messages.
+    This helps catch issues early before they cause confusing errors later.
+    """
+    # Check if script name looks like it was run incorrectly with torchrun
+    # When someone runs: torchrun --nproc_per_node=4 python train_distillation.py
+    # The script name would be 'python' which would cause an error
+    script_name = os.path.basename(sys.argv[0])
+    
+    if script_name == 'python' or script_name == 'python3':
+        print("=" * 80)
+        print("ERROR: Incorrect usage detected!")
+        print("=" * 80)
+        print()
+        print("It looks like you're trying to run this script with 'torchrun' but")
+        print("included 'python' before the script name.")
+        print()
+        print("When using torchrun, do NOT include 'python' before the script name.")
+        print("torchrun already invokes Python internally.")
+        print()
+        print("✗ Wrong:")
+        print("  torchrun --nproc_per_node=4 python train_distillation.py ...")
+        print()
+        print("✓ Correct:")
+        print("  torchrun --nproc_per_node=4 train_distillation.py ...")
+        print()
+        print("=" * 80)
+        sys.exit(1)
+
+
+# -----------------------------------------------------------------------------
 # Multi-GPU / Distributed Training Setup
 # -----------------------------------------------------------------------------
 
@@ -37,8 +72,43 @@ def setup_distributed():
         print("Not using distributed mode")
         return 0, 1, 0
     
+    # Validate that we have enough GPUs for the requested number of processes
+    num_gpus = torch.cuda.device_count()
+    if local_rank >= num_gpus:
+        print("=" * 80)
+        print(f"ERROR: Invalid GPU configuration!")
+        print("=" * 80)
+        print()
+        print(f"This process (rank {rank}, local_rank {local_rank}) is trying to use GPU index {local_rank},")
+        print(f"but only {num_gpus} GPU(s) are available on this machine (GPU indices 0 to {num_gpus-1}).")
+        print()
+        print("This happens when you request more processes than available GPUs.")
+        print()
+        print(f"✗ Current command uses: --nproc_per_node={os.environ.get('LOCAL_WORLD_SIZE', 'unknown')}")
+        print(f"✓ Available GPUs: {num_gpus}")
+        print()
+        print("Solutions:")
+        print(f"  1. Reduce --nproc_per_node to match available GPUs:")
+        print(f"     torchrun --nproc_per_node={num_gpus} train_distillation.py ...")
+        print()
+        print("  2. Or run on CPU without distributed training:")
+        print("     python train_distillation.py ... (without --distributed flag)")
+        print()
+        print("=" * 80)
+        sys.exit(1)
+    
+    # Set the device before initializing the process group
+    # This must be done before init_process_group to ensure proper GPU mapping
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    
+    # Initialize the distributed process group
+    # The NCCL backend will use the device set by torch.cuda.set_device()
+    dist.init_process_group(
+        backend='nccl', 
+        init_method='env://', 
+        world_size=world_size, 
+        rank=rank
+    )
     dist.barrier()
     
     return rank, world_size, local_rank
@@ -50,6 +120,24 @@ def cleanup_distributed():
     """
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def print_gpu_memory_summary(rank=0, prefix=""):
+    """
+    Print GPU memory usage summary for debugging OOM issues.
+    """
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / 1024**3  # Convert to GB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3  # Convert to GB
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3  # Convert to GB
+        
+        print(f"[Rank {rank}] {prefix} GPU Memory:")
+        print(f"  Allocated: {allocated:.2f} GB")
+        print(f"  Reserved:  {reserved:.2f} GB")
+        print(f"  Max Allocated: {max_allocated:.2f} GB")
+        print(f"  Total: {total:.2f} GB")
+        print(f"  Free: {total - allocated:.2f} GB")
 
 
 def is_main_process(rank):
@@ -151,10 +239,11 @@ class WanLiteStudent(nn.Module):
     to the student's 2D image architecture.
     """
 
-    def __init__(self, config, teacher_checkpoint_path=None, device=None, distributed=False):
+    def __init__(self, config, teacher_checkpoint_path=None, device=None, distributed=False, use_gradient_checkpointing=False):
         super().__init__()
         self.config = config
         self.distributed = distributed
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         # Default to cuda if available, otherwise cpu
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -254,9 +343,15 @@ class WanLiteStudent(nn.Module):
         batch, channels, h, w = x.shape
         x = x.flatten(2).transpose(1, 2)  # (batch, h*w, channels)
 
-        # We must pass t_emb and text_emb to every block now
-        for block in self.blocks:
-            x = block(x, t_emb, text_emb)
+        # MEMORY OPTIMIZATION: Use gradient checkpointing if enabled
+        # This trades compute for memory by not storing intermediate activations
+        if self.use_gradient_checkpointing and self.training:
+            for block in self.blocks:
+                x = torch.utils.checkpoint.checkpoint(block, x, t_emb, text_emb, use_reentrant=False)
+        else:
+            # Standard forward pass
+            for block in self.blocks:
+                x = block(x, t_emb, text_emb)
 
         # Reshape back: (batch, h*w, channels) -> (batch, channels, h, w)
         x = x.transpose(1, 2).reshape(batch, channels, h, w)
@@ -342,6 +437,9 @@ def load_config(json_path):
 # -----------------------------------------------------------------------------
 
 def main():
+    # 0. Check for common command-line usage mistakes
+    check_command_line_usage()
+    
     # 1. Argument Parsing
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher_path", type=str, required=True)
@@ -362,10 +460,60 @@ def main():
                         help="Local rank for distributed training (set automatically by torch.distributed.launch)")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="Number of data loading workers (default: 0, set to 4+ for better performance)")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to save memory at the cost of slower training")
 
     args = parser.parse_args()
     
-    # 2. Setup distributed training if enabled
+    # 2. Early validation for distributed training
+    if args.distributed:
+        # Check if CUDA is available
+        if not torch.cuda.is_available():
+            print("=" * 80)
+            print("ERROR: Distributed training requires CUDA")
+            print("=" * 80)
+            print()
+            print("You specified --distributed flag, but CUDA is not available.")
+            print("Distributed training with NCCL backend requires GPUs.")
+            print()
+            print("Solutions:")
+            print("  1. Run without --distributed flag for CPU training:")
+            print("     python train_distillation.py ...")
+            print()
+            print("  2. Or ensure CUDA is properly installed and GPUs are available")
+            print()
+            print("=" * 80)
+            sys.exit(1)
+        
+        # Early check for GPU count vs requested processes
+        num_gpus = torch.cuda.device_count()
+        if 'LOCAL_WORLD_SIZE' in os.environ:
+            requested_procs = int(os.environ['LOCAL_WORLD_SIZE'])
+            if requested_procs > num_gpus:
+                print("=" * 80)
+                print("ERROR: Insufficient GPUs for requested processes")
+                print("=" * 80)
+                print()
+                print(f"You are trying to launch {requested_procs} processes (--nproc_per_node={requested_procs})")
+                print(f"but only {num_gpus} GPU(s) are available on this machine.")
+                print()
+                print("Each process needs its own GPU for distributed training.")
+                print()
+                print("Solutions:")
+                print(f"  1. Reduce the number of processes to match available GPUs:")
+                print(f"     torchrun --nproc_per_node={num_gpus} train_distillation.py ... --distributed")
+                print()
+                print("  2. Or run without distributed training:")
+                print("     python train_distillation.py ... (without --distributed flag)")
+                print()
+                if num_gpus > 1:
+                    print(f"  3. Or use DataParallel with --multi_gpu (no torchrun needed):")
+                    print(f"     python train_distillation.py ... --multi_gpu")
+                    print()
+                print("=" * 80)
+                sys.exit(1)
+    
+    # 3. Setup distributed training if enabled
     rank = 0
     world_size = 1
     local_rank = args.local_rank
@@ -380,7 +528,7 @@ def main():
             print(f"Multi-GPU training enabled with {torch.cuda.device_count()} GPUs using DataParallel")
         print(f"Using device: {device}")
     
-    # 3. Load Configuration
+    # 4. Load Configuration
     student_config = load_config(args.student_config)
 
     # Safety check to ensure config loaded successfully
@@ -391,14 +539,18 @@ def main():
             cleanup_distributed()
         return
 
-    # 4. Initialize Student Model
+    # 5. Initialize Student Model
     # Initialize with teacher checkpoint path to enable weight projection
     student_model = WanLiteStudent(
         student_config, 
         teacher_checkpoint_path=args.teacher_path, 
         device=device,
-        distributed=args.distributed
+        distributed=args.distributed,
+        use_gradient_checkpointing=args.gradient_checkpointing
     )
+    
+    if is_main_process(rank) and args.gradient_checkpointing:
+        print("✓ Gradient checkpointing enabled - trading compute for memory")
     
     # Apply multi-GPU wrapper if enabled
     if args.distributed:
@@ -412,7 +564,7 @@ def main():
         if is_main_process(rank):
             print(f"Model wrapped with DataParallel on {torch.cuda.device_count()} GPUs")
 
-    # 5. Initialize Teacher Model (Diffusers)
+    # 6. Initialize Teacher Model (Diffusers)
     # This loads the model from the path specified
     # Only print from main process or if not using distributed training
     if is_main_process(rank) or not args.distributed:
@@ -526,6 +678,34 @@ def main():
     # Adjust this if your Diffusers model structure is different
     teacher_model = teacher_pipe.transformer
     teacher_model.eval()  # Teacher should not be trained
+    
+    # MEMORY OPTIMIZATION: Delete unused pipeline components to free GPU memory
+    # The pipeline contains text_encoder, vae, scheduler, and other components
+    # that consume significant memory but are not used during training
+    # MEMORY OPTIMIZATION: Keep references to needed components and delete unused ones
+    # Initialize variables to None to ensure they always exist
+    teacher_text_encoder = None
+    teacher_tokenizer = None
+    
+    if hasattr(teacher_pipe, 'text_encoder'):
+        # Keep reference to text encoder for prompt encoding
+        teacher_text_encoder = teacher_pipe.text_encoder
+        teacher_tokenizer = teacher_pipe.tokenizer if hasattr(teacher_pipe, 'tokenizer') else None
+    
+    # Delete heavy components we don't need
+    if hasattr(teacher_pipe, 'vae'):
+        del teacher_pipe.vae
+    if hasattr(teacher_pipe, 'scheduler'):
+        del teacher_pipe.scheduler
+    # Clear CUDA cache after freeing memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    if is_main_process(rank):
+        print("✓ Cleaned up unused teacher pipeline components")
+        if torch.cuda.is_available():
+            print_gpu_memory_summary(rank, "After teacher cleanup")
+    
     # Add this inside your main loop or initialization
     if is_main_process(rank):
         print("--- Teacher Model Config ---")
@@ -540,7 +720,7 @@ def main():
         if hasattr(teacher_model, 'patch_embedding'):
             print(f"Patch embedding shape: {teacher_model.patch_embedding.weight.shape}")
 
-    # 6. Initialize Dataset and Dataloader
+    # 7. Initialize Dataset and Dataloader
     dataset = StaticPromptsDataset(args.data_path)
     
     # Use DistributedSampler for distributed training
@@ -561,16 +741,45 @@ def main():
             num_workers=args.num_workers  # Configurable number of workers
         )
 
-    # 7. Optimizer and Loss
+    # 8. Optimizer and Loss
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.lr)
     loss_fn = torch.nn.functional.mse_loss
+    
+    # MEMORY OPTIMIZATION: Pre-create projection layer if needed
+    # This avoids recreating it every batch which causes memory leaks
+    proj_layer = None
+    expected_channels = teacher_model.config.get('in_channels', 4)
+    student_channels = student_config["num_channels"]
+    
+    if student_channels != expected_channels:
+        if is_main_process(rank):
+            print(f"Creating projection layer: {student_channels} -> {expected_channels} channels")
+        proj_layer = nn.Conv3d(
+            in_channels=student_channels,
+            out_channels=expected_channels,
+            kernel_size=1
+        )
+        # Initialize weights to zeros
+        nn.init.zeros_(proj_layer.weight)
+        if proj_layer.bias is not None:
+            nn.init.zeros_(proj_layer.bias)
+        
+        # Move to device and freeze parameters (no need for eval mode)
+        proj_layer = proj_layer.float().to(device)
+        for param in proj_layer.parameters():
+            param.requires_grad = False
+        if is_main_process(rank):
+            print("✓ Projection layer created and cached")
 
-    # 8. Training Loop
+    # 9. Training Loop
     student_model.train()  # Student needs to be in train mode
     global_step = 0
 
     if is_main_process(rank):
         print("Starting distillation training...")
+        # Print initial memory usage
+        if torch.cuda.is_available():
+            print_gpu_memory_summary(rank, "Initial")
 
     # Fixed: Use args.num_epochs
     for epoch in range(args.num_epochs):
@@ -579,140 +788,176 @@ def main():
             sampler.set_epoch(epoch)
             
         for batch in dataloader:
-            # --- DATA PREPARATION ---
-            # batch is a list of prompt strings
-            prompts = batch
+            try:
+                # --- DATA PREPARATION ---
+                # batch is a list of prompt strings
+                prompts = batch
 
-            # Encode the prompts using the teacher's text encoder
-            # For Diffusers models, text encoding is usually done via encode_prompt or similar
-            # We'll use a simple approach assuming teacher_pipe has text_encoder
-            if hasattr(teacher_pipe, 'encode_prompt'):
-                # Use encode_prompt if available
-                text_embeddings = teacher_pipe.encode_prompt(
-                    prompts,
-                    device=device,
-                    # num_images_per_prompt=1,
-                    do_classifier_free_guidance=False
-                )[0]
-            elif hasattr(teacher_pipe, 'text_encoder'):
-                # Fallback to direct text encoder usage
-                if hasattr(teacher_pipe, 'tokenizer'):
-                    text_inputs = teacher_pipe.tokenizer(
+                # Encode the prompts using the teacher's text encoder
+                # Use the saved text encoder reference instead of teacher_pipe
+                if hasattr(teacher_pipe, 'encode_prompt'):
+                    # Use encode_prompt if available
+                    text_embeddings = teacher_pipe.encode_prompt(
                         prompts,
-                        padding="max_length",
-                        max_length=teacher_pipe.tokenizer.model_max_length,
-                        truncation=True,
-                        return_tensors="pt"
-                    ).to(device)
-                    text_embeddings = teacher_pipe.text_encoder(text_inputs.input_ids)[0]
+                        device=device,
+                        # num_images_per_prompt=1,
+                        do_classifier_free_guidance=False
+                    )[0]
+                elif teacher_text_encoder is not None:
+                    # Use the saved text encoder directly
+                    if teacher_tokenizer is not None:
+                        text_inputs = teacher_tokenizer(
+                            prompts,
+                            padding="max_length",
+                            max_length=teacher_tokenizer.model_max_length,
+                            truncation=True,
+                            return_tensors="pt"
+                        ).to(device)
+                        with torch.no_grad():
+                            text_embeddings = teacher_text_encoder(text_inputs.input_ids)[0]
+                    else:
+                        raise ValueError("Text encoder found but no tokenizer available")
                 else:
-                    raise ValueError("Text encoder found but no tokenizer available")
-            else:
-                raise ValueError("No text encoder found in teacher pipeline")
+                    raise ValueError("No text encoder found in teacher pipeline")
 
-            # Generate random timesteps and latents for the step
-            # Shape: [batch_size, 16, 16, 4] (Example based on patch_size=16 and num_channels=4)
-            latents = torch.randn(
-                args.batch_size,
-                student_config["num_channels"],
-                student_config["image_size"] // student_config["patch_size"],
-                student_config["image_size"] // student_config["patch_size"],
-                device=device
-            )
+                # Generate random timesteps and latents for the step
+                # Shape: [batch_size, 16, 16, 4] (Example based on patch_size=16 and num_channels=4)
+                latents = torch.randn(
+                    args.batch_size,
+                    student_config["num_channels"],
+                    student_config["image_size"] // student_config["patch_size"],
+                    student_config["image_size"] // student_config["patch_size"],
+                    device=device
+                )
 
-            # Generate random timesteps
-            timesteps = torch.randint(0, 1000, (args.batch_size,), device=device).long()
+                # Generate random timesteps
+                timesteps = torch.randint(0, 1000, (args.batch_size,), device=device).long()
 
-            # --- TEACHER PASS ---
+                # --- TEACHER PASS ---
 
-            # Save original latents for student (before any projection)
-            # Student expects original num_channels (4), not projected channels
-            student_latents = latents.clone()
+                # Student will use the original latents directly
+                # For teacher, we need to transform the latents (unsqueeze, projection, etc.)
+                # These operations create new tensors, so student_latents remains unchanged
 
-            with torch.no_grad():
-                # 1. Ensure Latent Shape (B, C, T, H, W)
-                # This assumes your latent shape is currently (B, 4, T, H, W)
-                if latents.dim() == 4:
-                    latents = latents.unsqueeze(2)
+                with torch.no_grad():
+                    # 1. Ensure Latent Shape (B, C, T, H, W) for teacher
+                    # unsqueeze creates a new tensor, so latents is not modified
+                    if latents.dim() == 4:
+                        teacher_latents = latents.unsqueeze(2)
+                    else:
+                        teacher_latents = latents
 
-                current_channels = latents.shape[1]
+                    # MEMORY OPTIMIZATION: Check dtype before conversion to avoid unnecessary copies
+                    if teacher_latents.dtype != torch.float32:
+                        teacher_latents = teacher_latents.float()
+                    if text_embeddings.dtype != torch.float32:
+                        text_embeddings = text_embeddings.float()
 
-                # 2. Extract Expected Channels from Config
-                # Based on your printout: Expected in_channels (config): 16
-                expected_channels = teacher_model.config.get('in_channels', 4)
+                    # 2. Apply pre-created projection layer if needed
+                    # This creates a new tensor, original latents unchanged
+                    if proj_layer is not None:
+                        teacher_latents = proj_layer(teacher_latents)
 
-                # This handles the mismatch between the model's expectation and the device dtype
-                latents = latents.float()
-                text_embeddings = text_embeddings.float()
-
-                # 3. Inject Projection Layer if Mismatch Exists
-                if current_channels != expected_channels:
-                    print(f"Projection needed: {current_channels} -> {expected_channels}")
-
-                    # Define a Conv3d projection layer
-                    proj_layer = nn.Conv3d(
-                        in_channels=current_channels,
-                        out_channels=expected_channels,
-                        kernel_size=1
+                    # 3. Pass through teacher
+                    # Cast timesteps to float32 to satisfy Linear layer requirements
+                    teacher_output = teacher_model(
+                        hidden_states=teacher_latents,
+                        timestep=timesteps.float(),
+                        encoder_hidden_states=text_embeddings,
                     )
 
-                    # Initialize weights to 0
-                    nn.init.zeros_(proj_layer.weight)
-                    if proj_layer.bias is not None:
-                        nn.init.zeros_(proj_layer.bias)
+                    # Extract the actual tensor from teacher output
+                    # Diffusers models often return a dict or object with .sample attribute
+                    if isinstance(teacher_output, dict):
+                        teacher_output = teacher_output.get('sample', teacher_output)
+                    elif hasattr(teacher_output, 'sample'):
+                        teacher_output = teacher_output.sample
+                    
+                    # MEMORY OPTIMIZATION: Explicitly detach teacher output to free computation graph
+                    teacher_output = teacher_output.detach()
+                    
+                    # Free intermediate tensors used only for teacher
+                    del teacher_latents
 
-                    # --- FIX ---
-                    # Cast the projection layer to Float32 explicitly
-                    proj_layer = proj_layer.float()
+                # --- STUDENT PASS ---
 
-                    # Move to device (latents.device is now effectively Float32 due to .float() above)
-                    proj_layer = proj_layer.to(latents.device)
-
-                    # Apply projection (only for teacher, not student)
-                    latents = proj_layer(latents)
-
-                # 4. Pass through teacher
-                # Cast timesteps to float32 to satisfy Linear layer requirements
-                teacher_output = teacher_model(
-                    hidden_states=latents,
-                    timestep=timesteps.float(),  # <--- Ensure timestep is also float32
+                # Use original latents for student (not the projected ones used for teacher)
+                # Student conv_in expects config['num_channels'], not teacher's in_channels
+                student_output = student_model(
+                    latent_0=latents,  # Use latents directly, not student_latents reference
+                    latent_1=None,
+                    timestep=timesteps,
                     encoder_hidden_states=text_embeddings,
                 )
 
-                # ... (Extract output logic) ...
+                # --- LOSS CALCULATION ---
+                loss = loss_fn(student_output, teacher_output)
 
-                # Extract the actual tensor from teacher output
-                # Diffusers models often return a dict or object with .sample attribute
-                if isinstance(teacher_output, dict):
-                    teacher_output = teacher_output.get('sample', teacher_output)
-                elif hasattr(teacher_output, 'sample'):
-                    teacher_output = teacher_output.sample
+                # --- BACKPROPAGATION ---
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-            # --- STUDENT PASS ---
+                global_step += 1
+                
+                # Save loss value before deleting the tensor
+                loss_value = loss.item()
+                
+                # MEMORY OPTIMIZATION: Explicitly delete tensors and clear cache periodically
+                # Only delete tensors that still exist in scope
+                del latents, timesteps, text_embeddings, teacher_output, student_output, loss
+                
+                # Clear CUDA cache every 100 steps to prevent memory fragmentation
+                if global_step % 100 == 0:
+                    torch.cuda.empty_cache()
 
-            # Use original latents for student (not the projected ones used for teacher)
-            # Student conv_in expects config['num_channels'], not teacher's in_channels
-            student_output = student_model(
-                latent_0=student_latents,
-                latent_1=None,
-                timestep=timesteps,
-                encoder_hidden_states=text_embeddings,
-            )
+                if global_step % 50 == 0 and is_main_process(rank):
+                    print(f"Step {global_step}: Loss = {loss_value}")
+                    if torch.cuda.is_available() and global_step % 200 == 0:
+                        print_gpu_memory_summary(rank, f"Step {global_step}")
+            
+            except torch.cuda.OutOfMemoryError as e:
+                if is_main_process(rank):
+                    print("=" * 80)
+                    print("ERROR: CUDA Out of Memory!")
+                    print("=" * 80)
+                    print()
+                    print_gpu_memory_summary(rank, "Current")
+                    print()
+                    print("The model or batch size is too large for available GPU memory.")
+                    print()
+                    print("Solutions:")
+                    print(f"  1. Reduce batch size (current: {args.batch_size}):")
+                    print(f"     --batch_size {max(1, args.batch_size // 2)}")
+                    print()
+                    print("  2. Reduce model size in config (hidden_size, depth, num_heads)")
+                    print()
+                    print("  3. Enable gradient checkpointing (if implemented)")
+                    print()
+                    print("  4. Use mixed precision training with torch.amp")
+                    print()
+                    print("  5. Set environment variable for better memory management:")
+                    print("     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+                    print()
+                    print("=" * 80)
+                
+                # Clean up before exiting
+                if args.distributed:
+                    cleanup_distributed()
+                sys.exit(1)
+            
+            except Exception as e:
+                if is_main_process(rank):
+                    print(f"ERROR during training step: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Clean up before exiting
+                if args.distributed:
+                    cleanup_distributed()
+                raise
 
-            # --- LOSS CALCULATION ---
-            loss = loss_fn(student_output, teacher_output)
-
-            # --- BACKPROPAGATION ---
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            global_step += 1
-
-            if global_step % 50 == 0 and is_main_process(rank):
-                print(f"Step {global_step}: Loss = {loss.item()}")
-
-    # 9. Save Model (only from main process)
+    # 10. Save Model (only from main process)
     if is_main_process(rank):
         # Unwrap model if using DataParallel or DistributedDataParallel
         model_to_save = student_model.module if hasattr(student_model, 'module') else student_model

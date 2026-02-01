@@ -56,6 +56,11 @@ DistributedDataParallel (DDP) is the recommended approach for multi-GPU training
 
 Use `torch.distributed.launch` or `torchrun` to start distributed training:
 
+> **⚠️ Important:** When using `torchrun`, do NOT include `python` before the script name.  
+> The command `torchrun python train_distillation.py` will fail because `torchrun` already invokes Python internally.  
+> **Correct:** `torchrun train_distillation.py ...`  
+> **Wrong:** `torchrun python train_distillation.py ...`
+
 ```bash
 # Using torchrun (PyTorch 2.0+, recommended)
 torchrun --nproc_per_node=4 train_distillation.py \
