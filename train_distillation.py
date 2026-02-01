@@ -72,17 +72,43 @@ def setup_distributed():
         print("Not using distributed mode")
         return 0, 1, 0
     
+    # Validate that we have enough GPUs for the requested number of processes
+    num_gpus = torch.cuda.device_count()
+    if local_rank >= num_gpus:
+        print("=" * 80)
+        print(f"ERROR: Invalid GPU configuration!")
+        print("=" * 80)
+        print()
+        print(f"This process (rank {rank}, local_rank {local_rank}) is trying to use GPU {local_rank},")
+        print(f"but only {num_gpus} GPU(s) are available on this machine (GPU 0 to GPU {num_gpus-1}).")
+        print()
+        print("This happens when you request more processes than available GPUs.")
+        print()
+        print(f"✗ Current command uses: --nproc_per_node={os.environ.get('LOCAL_WORLD_SIZE', 'unknown')}")
+        print(f"✓ Available GPUs: {num_gpus}")
+        print()
+        print("Solutions:")
+        print(f"  1. Reduce --nproc_per_node to match available GPUs:")
+        print(f"     torchrun --nproc_per_node={num_gpus} train_distillation.py ...")
+        print()
+        print("  2. Or run on CPU without distributed training:")
+        print("     python train_distillation.py ... (without --distributed flag)")
+        print()
+        print("=" * 80)
+        sys.exit(1)
+    
     # Set the device before initializing the process group
     torch.cuda.set_device(local_rank)
     
     # Initialize process group with explicit device_id to avoid GPU mapping warnings
     # This ensures each process knows which GPU it should use
+    # device_id should be an integer representing the local rank
     dist.init_process_group(
         backend='nccl', 
         init_method='env://', 
         world_size=world_size, 
         rank=rank,
-        device_id=torch.device(f'cuda:{local_rank}')
+        device_id=local_rank
     )
     dist.barrier()
     
@@ -413,7 +439,55 @@ def main():
 
     args = parser.parse_args()
     
-    # 2. Setup distributed training if enabled
+    # 2. Early validation for distributed training
+    if args.distributed:
+        # Check if CUDA is available
+        if not torch.cuda.is_available():
+            print("=" * 80)
+            print("ERROR: Distributed training requires CUDA")
+            print("=" * 80)
+            print()
+            print("You specified --distributed flag, but CUDA is not available.")
+            print("Distributed training with NCCL backend requires GPUs.")
+            print()
+            print("Solutions:")
+            print("  1. Run without --distributed flag for CPU training:")
+            print("     python train_distillation.py ...")
+            print()
+            print("  2. Or ensure CUDA is properly installed and GPUs are available")
+            print()
+            print("=" * 80)
+            sys.exit(1)
+        
+        # Early check for GPU count vs requested processes
+        num_gpus = torch.cuda.device_count()
+        if 'LOCAL_WORLD_SIZE' in os.environ:
+            requested_procs = int(os.environ['LOCAL_WORLD_SIZE'])
+            if requested_procs > num_gpus:
+                print("=" * 80)
+                print("ERROR: Insufficient GPUs for requested processes")
+                print("=" * 80)
+                print()
+                print(f"You are trying to launch {requested_procs} processes (--nproc_per_node={requested_procs})")
+                print(f"but only {num_gpus} GPU(s) are available on this machine.")
+                print()
+                print("Each process needs its own GPU for distributed training.")
+                print()
+                print("Solutions:")
+                print(f"  1. Reduce the number of processes to match available GPUs:")
+                print(f"     torchrun --nproc_per_node={num_gpus} train_distillation.py ... --distributed")
+                print()
+                print("  2. Or run without distributed training:")
+                print("     python train_distillation.py ... (without --distributed flag)")
+                print()
+                if num_gpus > 1:
+                    print(f"  3. Or use DataParallel with --multi_gpu (no torchrun needed):")
+                    print(f"     python train_distillation.py ... --multi_gpu")
+                    print()
+                print("=" * 80)
+                sys.exit(1)
+    
+    # 3. Setup distributed training if enabled
     rank = 0
     world_size = 1
     local_rank = args.local_rank
@@ -428,7 +502,7 @@ def main():
             print(f"Multi-GPU training enabled with {torch.cuda.device_count()} GPUs using DataParallel")
         print(f"Using device: {device}")
     
-    # 3. Load Configuration
+    # 4. Load Configuration
     student_config = load_config(args.student_config)
 
     # Safety check to ensure config loaded successfully
@@ -439,7 +513,7 @@ def main():
             cleanup_distributed()
         return
 
-    # 4. Initialize Student Model
+    # 5. Initialize Student Model
     # Initialize with teacher checkpoint path to enable weight projection
     student_model = WanLiteStudent(
         student_config, 
@@ -460,7 +534,7 @@ def main():
         if is_main_process(rank):
             print(f"Model wrapped with DataParallel on {torch.cuda.device_count()} GPUs")
 
-    # 5. Initialize Teacher Model (Diffusers)
+    # 6. Initialize Teacher Model (Diffusers)
     # This loads the model from the path specified
     # Only print from main process or if not using distributed training
     if is_main_process(rank) or not args.distributed:
@@ -588,7 +662,7 @@ def main():
         if hasattr(teacher_model, 'patch_embedding'):
             print(f"Patch embedding shape: {teacher_model.patch_embedding.weight.shape}")
 
-    # 6. Initialize Dataset and Dataloader
+    # 7. Initialize Dataset and Dataloader
     dataset = StaticPromptsDataset(args.data_path)
     
     # Use DistributedSampler for distributed training
@@ -609,11 +683,11 @@ def main():
             num_workers=args.num_workers  # Configurable number of workers
         )
 
-    # 7. Optimizer and Loss
+    # 8. Optimizer and Loss
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.lr)
     loss_fn = torch.nn.functional.mse_loss
 
-    # 8. Training Loop
+    # 9. Training Loop
     student_model.train()  # Student needs to be in train mode
     global_step = 0
 
@@ -760,7 +834,7 @@ def main():
             if global_step % 50 == 0 and is_main_process(rank):
                 print(f"Step {global_step}: Loss = {loss.item()}")
 
-    # 9. Save Model (only from main process)
+    # 10. Save Model (only from main process)
     if is_main_process(rank):
         # Unwrap model if using DataParallel or DistributedDataParallel
         model_to_save = student_model.module if hasattr(student_model, 'module') else student_model
