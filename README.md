@@ -248,8 +248,9 @@ If you encounter CUDA Out of Memory errors during distributed training:
 
 ```bash
 # 1. Reduce batch size (most effective)
+# Reduce from 2 or 4 to 1
 torchrun --nproc_per_node=2 train_distillation.py \
-    --batch_size 1 \  # Reduce from 2 or 4
+    --batch_size 1 \
     --distributed \
     [other args...]
 
