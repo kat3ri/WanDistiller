@@ -239,10 +239,11 @@ class WanLiteStudent(nn.Module):
     to the student's 2D image architecture.
     """
 
-    def __init__(self, config, teacher_checkpoint_path=None, device=None, distributed=False):
+    def __init__(self, config, teacher_checkpoint_path=None, device=None, distributed=False, use_gradient_checkpointing=False):
         super().__init__()
         self.config = config
         self.distributed = distributed
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         # Default to cuda if available, otherwise cpu
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -342,9 +343,15 @@ class WanLiteStudent(nn.Module):
         batch, channels, h, w = x.shape
         x = x.flatten(2).transpose(1, 2)  # (batch, h*w, channels)
 
-        # We must pass t_emb and text_emb to every block now
-        for block in self.blocks:
-            x = block(x, t_emb, text_emb)
+        # MEMORY OPTIMIZATION: Use gradient checkpointing if enabled
+        # This trades compute for memory by not storing intermediate activations
+        if self.use_gradient_checkpointing and self.training:
+            for block in self.blocks:
+                x = torch.utils.checkpoint.checkpoint(block, x, t_emb, text_emb, use_reentrant=False)
+        else:
+            # Standard forward pass
+            for block in self.blocks:
+                x = block(x, t_emb, text_emb)
 
         # Reshape back: (batch, h*w, channels) -> (batch, channels, h, w)
         x = x.transpose(1, 2).reshape(batch, channels, h, w)
@@ -453,6 +460,8 @@ def main():
                         help="Local rank for distributed training (set automatically by torch.distributed.launch)")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="Number of data loading workers (default: 0, set to 4+ for better performance)")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to save memory at the cost of slower training")
 
     args = parser.parse_args()
     
@@ -536,8 +545,12 @@ def main():
         student_config, 
         teacher_checkpoint_path=args.teacher_path, 
         device=device,
-        distributed=args.distributed
+        distributed=args.distributed,
+        use_gradient_checkpointing=args.gradient_checkpointing
     )
+    
+    if is_main_process(rank) and args.gradient_checkpointing:
+        print("✓ Gradient checkpointing enabled - trading compute for memory")
     
     # Apply multi-GPU wrapper if enabled
     if args.distributed:

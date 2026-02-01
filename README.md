@@ -254,16 +254,23 @@ torchrun --nproc_per_node=2 train_distillation.py \
     --distributed \
     [other args...]
 
-# 2. Use fewer GPUs if memory per GPU is limited
+# 2. Enable gradient checkpointing (trades compute for memory)
+torchrun --nproc_per_node=2 train_distillation.py \
+    --batch_size 2 \
+    --distributed \
+    --gradient_checkpointing \
+    [other args...]
+
+# 3. Use fewer GPUs if memory per GPU is limited
 torchrun --nproc_per_node=1 train_distillation.py \
     --distributed \
     [other args...]
 
-# 3. Enable memory-efficient allocation
+# 4. Enable memory-efficient allocation
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 torchrun --nproc_per_node=2 train_distillation.py --distributed [other args...]
 
-# 4. Reduce model size in config/student_config.json
+# 5. Reduce model size in config/student_config.json
 # Edit these parameters:
 # - "hidden_size": 512 (reduce from 1024)
 # - "depth": 8 (reduce from 16)
@@ -274,7 +281,14 @@ torchrun --nproc_per_node=2 train_distillation.py --distributed [other args...]
 - Each GPU process loads both teacher and student models
 - Larger batch sizes require more memory
 - Larger image_size increases memory usage quadratically
+- Gradient checkpointing reduces memory by ~40% but slows training by ~20%
 - Monitor GPU memory with `nvidia-smi` during training
+
+**Memory Optimizations Applied:**
+- Automatic cleanup of unused teacher pipeline components (VAE, scheduler)
+- Projection layers are cached instead of recreated each batch
+- Explicit tensor cleanup after each training step
+- CUDA cache cleared periodically to prevent fragmentation
 
 ### Slow Training
 ```bash
