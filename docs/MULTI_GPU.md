@@ -57,7 +57,7 @@ DistributedDataParallel (DDP) is the recommended approach for multi-GPU training
 Use `torch.distributed.launch` or `torchrun` to start distributed training:
 
 ```bash
-# Using torchrun (PyTorch 1.10+)
+# Using torchrun (PyTorch 2.0+, recommended)
 torchrun --nproc_per_node=4 train_distillation.py \
     --teacher_path "timbrooks/instruct-wan" \
     --student_config "config/student_config.json" \
@@ -68,7 +68,7 @@ torchrun --nproc_per_node=4 train_distillation.py \
     --lr 1e-5 \
     --distributed
 
-# Or using torch.distributed.launch (older PyTorch)
+# Or using torch.distributed.launch (older PyTorch, deprecated)
 python -m torch.distributed.launch --nproc_per_node=4 train_distillation.py \
     --teacher_path "timbrooks/instruct-wan" \
     --student_config "config/student_config.json" \
@@ -201,9 +201,21 @@ export NCCL_IB_DISABLE=1  # Disable InfiniBand if not available
 ### Issue: Slow data loading
 
 **Solution:**
-Currently `num_workers=0` to avoid multiprocessing issues. For faster data loading:
+The default `num_workers=0` avoids multiprocessing issues but can be slow. For faster data loading:
+
+```bash
+# Increase data loading workers (recommended: 4-8)
+python train_distillation.py \
+    --num_workers 4 \
+    --distributed \
+    # ... other args
+```
+
+Tips:
 1. Ensure data is on fast storage (SSD)
-2. Consider increasing `num_workers` if stable (may require code adjustment)
+2. Start with `--num_workers 4` and increase if stable
+3. Set `num_workers` to number of CPU cores for maximum performance
+4. Too many workers can cause memory issues - tune based on your system
 
 ### Issue: Processes hang at initialization
 

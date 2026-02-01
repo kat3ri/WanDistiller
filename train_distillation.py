@@ -360,6 +360,8 @@ def main():
                         help="Enable distributed training using DistributedDataParallel (recommended for multi-GPU)")
     parser.add_argument("--local_rank", type=int, default=0,
                         help="Local rank for distributed training (set automatically by torch.distributed.launch)")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="Number of data loading workers (default: 0, set to 4+ for better performance)")
 
     args = parser.parse_args()
     
@@ -412,7 +414,8 @@ def main():
 
     # 5. Initialize Teacher Model (Diffusers)
     # This loads the model from the path specified
-    if is_main_process(rank):
+    # Only print from main process or if not using distributed training
+    if is_main_process(rank) or not args.distributed:
         print(f"Loading teacher model from: {args.teacher_path}")
 
     teacher_pipe = None
@@ -547,11 +550,16 @@ def main():
             dataset, 
             batch_size=args.batch_size, 
             sampler=sampler,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues
+            num_workers=args.num_workers,  # Configurable number of workers
             pin_memory=True
         )
     else:
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, 
+            batch_size=args.batch_size, 
+            shuffle=True,
+            num_workers=args.num_workers  # Configurable number of workers
+        )
 
     # 7. Optimizer and Loss
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.lr)
