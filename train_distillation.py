@@ -610,7 +610,9 @@ def main():
             
             # Set device - load on CPU if requested
             if args.teacher_on_cpu:
-                load_kwargs["device_map"] = "cpu"
+                # For CPU loading, use low_cpu_mem_usage for efficient memory usage
+                # Don't use device_map as "cpu" is not a valid strategy
+                load_kwargs["low_cpu_mem_usage"] = True
             elif torch.cuda.is_available():
                 # Load on current GPU device
                 load_kwargs["device_map"] = {"": device}
@@ -622,10 +624,15 @@ def main():
                 **load_kwargs
             )
 
+        # Only move to device if we didn't use device_map or if we're targeting CPU
         if is_main_process(rank):
-            print(f"   Moving pipeline to {device}...")
-        teacher_pipe.to(device)
-        if is_main_process(rank):
+            if "device_map" not in load_kwargs:
+                print(f"   Moving pipeline to {device}...")
+                teacher_pipe.to(device)
+            elif args.teacher_on_cpu and device != torch.device("cpu"):
+                # Teacher is on CPU but student is on GPU - keep teacher on CPU
+                teacher_pipe.to("cpu")
+                print(f"   Teacher model kept on CPU (student on {device})")
             print("✓ Loaded real teacher model from local cache")
 
         # Note about UMT5 text encoder
@@ -659,7 +666,9 @@ def main():
                 
                 # Set device - load on CPU if requested
                 if args.teacher_on_cpu:
-                    load_kwargs["device_map"] = "cpu"
+                    # For CPU loading, use low_cpu_mem_usage for efficient memory usage
+                    # Don't use device_map as "cpu" is not a valid strategy
+                    load_kwargs["low_cpu_mem_usage"] = True
                 elif torch.cuda.is_available():
                     # Load on current GPU device
                     load_kwargs["device_map"] = {"": device}
@@ -676,9 +685,11 @@ def main():
                 if "device_map" not in load_kwargs:
                     print(f"   Moving pipeline to {device}...")
                     teacher_pipe.to(device)
-                    print("✓ Loaded real teacher model from HuggingFace")
-                else:
-                    print("✓ Loaded real teacher model from HuggingFace")
+                elif args.teacher_on_cpu and device != torch.device("cpu"):
+                    # Teacher is on CPU but student is on GPU - keep teacher on CPU
+                    teacher_pipe.to("cpu")
+                    print(f"   Teacher model kept on CPU (student on {device})")
+                print("✓ Loaded real teacher model from HuggingFace")
 
 
             # Note about UMT5 text encoder
