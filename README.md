@@ -83,6 +83,12 @@ torchrun --nproc_per_node=4 train_distillation.py \
     --distributed
 ```
 
+> **⚠️ Important:** When using `torchrun`, do NOT include `python` before the script name. 
+> The command `torchrun python train_distillation.py` will fail because `torchrun` already invokes Python internally.
+> 
+> **Correct:** `torchrun --nproc_per_node=4 train_distillation.py ...`  
+> **Wrong:** `torchrun --nproc_per_node=4 python train_distillation.py ...`
+
 See [docs/MULTI_GPU.md](docs/MULTI_GPU.md) for detailed multi-GPU training guide.
 
 ## 📁 Project Structure

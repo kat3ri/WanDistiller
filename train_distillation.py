@@ -17,6 +17,41 @@ from projection_mapper import load_and_project_weights
 
 
 # -----------------------------------------------------------------------------
+# Validation and Error Detection
+# -----------------------------------------------------------------------------
+
+def check_command_line_usage():
+    """
+    Check if the script is being run with common mistakes and provide helpful error messages.
+    This helps catch issues early before they cause confusing errors later.
+    """
+    # Check if script name looks like it was run incorrectly with torchrun
+    # When someone runs: torchrun --nproc_per_node=4 python train_distillation.py
+    # The script name would be 'python' which would cause an error
+    script_name = os.path.basename(sys.argv[0])
+    
+    if script_name == 'python' or script_name == 'python3':
+        print("=" * 80)
+        print("ERROR: Incorrect usage detected!")
+        print("=" * 80)
+        print()
+        print("It looks like you're trying to run this script with 'torchrun' but")
+        print("included 'python' before the script name.")
+        print()
+        print("When using torchrun, do NOT include 'python' before the script name.")
+        print("torchrun already invokes Python internally.")
+        print()
+        print("✗ Wrong:")
+        print("  torchrun --nproc_per_node=4 python train_distillation.py ...")
+        print()
+        print("✓ Correct:")
+        print("  torchrun --nproc_per_node=4 train_distillation.py ...")
+        print()
+        print("=" * 80)
+        sys.exit(1)
+
+
+# -----------------------------------------------------------------------------
 # Multi-GPU / Distributed Training Setup
 # -----------------------------------------------------------------------------
 
@@ -37,8 +72,18 @@ def setup_distributed():
         print("Not using distributed mode")
         return 0, 1, 0
     
+    # Set the device before initializing the process group
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    
+    # Initialize process group with explicit device_id to avoid GPU mapping warnings
+    # This ensures each process knows which GPU it should use
+    dist.init_process_group(
+        backend='nccl', 
+        init_method='env://', 
+        world_size=world_size, 
+        rank=rank,
+        device_id=torch.device(f'cuda:{local_rank}')
+    )
     dist.barrier()
     
     return rank, world_size, local_rank
@@ -342,6 +387,9 @@ def load_config(json_path):
 # -----------------------------------------------------------------------------
 
 def main():
+    # 0. Check for common command-line usage mistakes
+    check_command_line_usage()
+    
     # 1. Argument Parsing
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher_path", type=str, required=True)
