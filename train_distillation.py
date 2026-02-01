@@ -411,7 +411,7 @@ def main():
         print("  1. The model is downloaded and cached locally, OR")
         print("  2. You have internet access to download from HuggingFace Hub")
         print("\nTo cache the model, run:")
-        print(f"  python -c \"from diffusers import DiffusionPipeline; DiffusionPipeline.from_pretrained('{args.teacher_path}')\"")
+        print(f"  python -c 'from diffusers import DiffusionPipeline; DiffusionPipeline.from_pretrained(\"{args.teacher_path}\")'")
         print("="*80)
         sys.exit(1)
     
