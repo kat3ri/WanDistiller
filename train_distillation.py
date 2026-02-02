@@ -757,11 +757,11 @@ def main():
     proj_layer = None
     teacher_device = None
     teacher_dtype = None
-    vae_z_dim = 16  # Default WAN VAE latent channels
+    # Get VAE z_dim from teacher VAE config if available
+    vae_z_dim = teacher_vae.model.z_dim if teacher_vae is not None else 16
     
     if teacher_model is not None:
         # Use VAE z_dim (latent channels) instead of transformer in_channels
-        vae_z_dim = teacher_vae.model.z_dim if teacher_vae is not None else 16
         student_channels = student_config["num_channels"]
         
         if student_channels != vae_z_dim:
@@ -840,6 +840,8 @@ def main():
                         embed_dim = text_embeddings_list[0].shape[1]
                         
                         # Create padded tensor
+                        # Note: Zero-padding is appropriate here as the WAN model uses attention masks
+                        # and the padded positions will be ignored during cross-attention
                         text_embeddings = torch.zeros(
                             batch_size, max_len, embed_dim,
                             dtype=text_embeddings_list[0].dtype,
@@ -877,8 +879,13 @@ def main():
                         teacher_latents_list = [latents[i] for i in range(latents.shape[0])]
                     
                     # 2. Apply projection layer if needed (to match VAE z_dim)
+                    # Batch the projection operation for efficiency
                     if proj_layer is not None:
-                        teacher_latents_list = [proj_layer(t.unsqueeze(0)).squeeze(0) for t in teacher_latents_list]
+                        # Stack to [B, C, F, H, W], apply projection, then unstack
+                        teacher_latents_batch = torch.stack(teacher_latents_list)
+                        teacher_latents_batch = proj_layer(teacher_latents_batch)
+                        teacher_latents_list = [teacher_latents_batch[i] for i in range(teacher_latents_batch.shape[0])]
+                        del teacher_latents_batch
                     
                     # 3. Move to teacher device and dtype
                     teacher_latents_list = [t.to(device=teacher_device, dtype=teacher_dtype) for t in teacher_latents_list]
@@ -892,8 +899,8 @@ def main():
                     timesteps_teacher = timesteps.to(teacher_device)
                     
                     # 6. Calculate seq_len for positional encoding
-                    # seq_len should be based on the latent spatial dimensions after patching
-                    _, _, F, H, W = teacher_latents_list[0].unsqueeze(0).shape
+                    # Extract dimensions directly from first latent tensor
+                    C, F, H, W = teacher_latents_list[0].shape
                     patch_size = teacher_wan.patch_size
                     seq_len = (F // patch_size[0]) * (H // patch_size[1]) * (W // patch_size[2])
                     
