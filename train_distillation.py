@@ -35,23 +35,23 @@ def check_command_line_usage():
     script_name = os.path.basename(sys.argv[0])
     
     if script_name == 'python' or script_name == 'python3':
-        print("=" * 80)
-        print("ERROR: Incorrect usage detected!")
-        print("=" * 80)
-        print()
-        print("It looks like you're trying to run this script with 'torchrun' but")
-        print("included 'python' before the script name.")
-        print()
-        print("When using torchrun, do NOT include 'python' before the script name.")
-        print("torchrun already invokes Python internally.")
-        print()
-        print("✗ Wrong:")
-        print("  torchrun --nproc_per_node=4 python train_distillation.py ...")
-        print()
-        print("✓ Correct:")
-        print("  torchrun --nproc_per_node=4 train_distillation.py ...")
-        print()
-        print("=" * 80)
+        print("=" * 80, file=sys.stderr)
+        print("ERROR: Incorrect usage detected!", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(file=sys.stderr)
+        print("It looks like you're trying to run this script with 'torchrun' but", file=sys.stderr)
+        print("included 'python' before the script name.", file=sys.stderr)
+        print(file=sys.stderr)
+        print("When using torchrun, do NOT include 'python' before the script name.", file=sys.stderr)
+        print("torchrun already invokes Python internally.", file=sys.stderr)
+        print(file=sys.stderr)
+        print("✗ Wrong:", file=sys.stderr)
+        print("  torchrun --nproc_per_node=4 python train_distillation.py ...", file=sys.stderr)
+        print(file=sys.stderr)
+        print("✓ Correct:", file=sys.stderr)
+        print("  torchrun --nproc_per_node=4 train_distillation.py ...", file=sys.stderr)
+        print(file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
         sys.exit(1)
 
 
@@ -90,44 +90,114 @@ def setup_distributed():
         print("Not using distributed mode")
         return 0, 1, 0
     
+    # Check if CUDA is available before proceeding
+    if not torch.cuda.is_available():
+        print("=" * 80, file=sys.stderr)
+        print(f"[Rank {rank}] ERROR: CUDA is not available!", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(file=sys.stderr)
+        print("Distributed training with NCCL backend requires CUDA-enabled GPUs.", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Solutions:", file=sys.stderr)
+        print("  1. Ensure CUDA is properly installed:", file=sys.stderr)
+        print("     - Check: nvidia-smi", file=sys.stderr)
+        print("     - Reinstall PyTorch with CUDA support if needed", file=sys.stderr)
+        print(file=sys.stderr)
+        print("  2. Run without distributed training:", file=sys.stderr)
+        print("     python train_distillation.py ... (remove torchrun)", file=sys.stderr)
+        print(file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        sys.exit(1)
+    
     # Validate that we have enough GPUs for the requested number of processes
     num_gpus = torch.cuda.device_count()
     if local_rank >= num_gpus:
-        print("=" * 80)
-        print(f"ERROR: Invalid GPU configuration!")
-        print("=" * 80)
-        print()
-        print(f"This process (rank {rank}, local_rank {local_rank}) is trying to use GPU index {local_rank},")
-        print(f"but only {num_gpus} GPU(s) are available on this machine (GPU indices 0 to {num_gpus-1}).")
-        print()
-        print("This happens when you request more processes than available GPUs.")
-        print()
-        print(f"✗ Current command uses: --nproc_per_node={os.environ.get('LOCAL_WORLD_SIZE', 'unknown')}")
-        print(f"✓ Available GPUs: {num_gpus}")
-        print()
-        print("Solutions:")
-        print(f"  1. Reduce --nproc_per_node to match available GPUs:")
-        print(f"     torchrun --nproc_per_node={num_gpus} train_distillation.py ...")
-        print()
-        print("  2. Or run on CPU without distributed training:")
-        print("     python train_distillation.py ... (without --distributed flag)")
-        print()
-        print("=" * 80)
+        print("=" * 80, file=sys.stderr)
+        print(f"[Rank {rank}] ERROR: Invalid GPU configuration!", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"This process (rank {rank}, local_rank {local_rank}) is trying to use GPU index {local_rank},", file=sys.stderr)
+        print(f"but only {num_gpus} GPU(s) are available on this machine (GPU indices 0 to {num_gpus-1}).", file=sys.stderr)
+        print(file=sys.stderr)
+        print("This happens when you request more processes than available GPUs.", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"✗ Current command uses: --nproc_per_node={os.environ.get('LOCAL_WORLD_SIZE', 'unknown')}", file=sys.stderr)
+        print(f"✓ Available GPUs: {num_gpus}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Solutions:", file=sys.stderr)
+        print(f"  1. Reduce --nproc_per_node to match available GPUs:", file=sys.stderr)
+        print(f"     torchrun --nproc_per_node={num_gpus} train_distillation.py ...", file=sys.stderr)
+        print(file=sys.stderr)
+        print("  2. Or run on CPU without distributed training:", file=sys.stderr)
+        print("     python train_distillation.py ... (without --distributed flag)", file=sys.stderr)
+        print(file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
         sys.exit(1)
     
     # Set the device before initializing the process group
     # This must be done before init_process_group to ensure proper GPU mapping
-    torch.cuda.set_device(local_rank)
+    try:
+        torch.cuda.set_device(local_rank)
+    except Exception as e:
+        print("=" * 80, file=sys.stderr)
+        print(f"[Rank {rank}] ERROR: Failed to set CUDA device {local_rank}", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"Error details: {e}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("This usually means:", file=sys.stderr)
+        print(f"  - GPU {local_rank} is not accessible", file=sys.stderr)
+        print(f"  - CUDA driver issue", file=sys.stderr)
+        print(f"  - GPU {local_rank} is being used by another process", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Solutions:", file=sys.stderr)
+        print("  1. Check GPU status: nvidia-smi", file=sys.stderr)
+        print("  2. Free up GPU memory or use a different GPU", file=sys.stderr)
+        print("  3. Restart CUDA driver if needed", file=sys.stderr)
+        print(file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        sys.exit(1)
     
     # Initialize the distributed process group
     # The NCCL backend will use the device set by torch.cuda.set_device()
-    dist.init_process_group(
-        backend='nccl', 
-        init_method='env://', 
-        world_size=world_size, 
-        rank=rank
-    )
-    dist.barrier()
+    try:
+        dist.init_process_group(
+            backend='nccl', 
+            init_method='env://', 
+            world_size=world_size, 
+            rank=rank
+        )
+        dist.barrier()
+    except Exception as e:
+        print("=" * 80, file=sys.stderr)
+        print(f"[Rank {rank}] ERROR: Failed to initialize distributed process group", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"Error details: {e}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Common causes:", file=sys.stderr)
+        print("  1. NCCL backend not properly installed or configured", file=sys.stderr)
+        print("  2. Network issues preventing inter-process communication", file=sys.stderr)
+        print("  3. Mismatched PyTorch/CUDA versions", file=sys.stderr)
+        print("  4. Environment variables not properly set by torchrun", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Current environment:", file=sys.stderr)
+        print(f"  RANK={rank}", file=sys.stderr)
+        print(f"  WORLD_SIZE={world_size}", file=sys.stderr)
+        print(f"  LOCAL_RANK={local_rank}", file=sys.stderr)
+        print(f"  MASTER_ADDR={os.environ.get('MASTER_ADDR', 'not set')}", file=sys.stderr)
+        print(f"  MASTER_PORT={os.environ.get('MASTER_PORT', 'not set')}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Solutions:", file=sys.stderr)
+        print("  1. Verify PyTorch is built with NCCL support:", file=sys.stderr)
+        print("     python -c 'import torch; print(torch.cuda.nccl.is_available())'", file=sys.stderr)
+        print(file=sys.stderr)
+        print("  2. Ensure proper network configuration if using multiple nodes", file=sys.stderr)
+        print(file=sys.stderr)
+        print("  3. Check firewall settings if communication fails", file=sys.stderr)
+        print(file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        sys.exit(1)
     
     return rank, world_size, local_rank
 
@@ -514,24 +584,6 @@ def main():
             print("Warning: Both --teacher_on_cpu and --teacher_device_strategy specified. Using --teacher_device_strategy.")
 
     if args.distributed:
-        # Check if CUDA is available (already partially checked in setup_distributed)
-        if not torch.cuda.is_available():
-            print("=" * 80)
-            print("ERROR: Distributed training requires CUDA")
-            print("=" * 80)
-            print()
-            print("You specified --distributed flag, but CUDA is not available.")
-            print("Distributed training with NCCL backend requires GPUs.")
-            print()
-            print("Solutions:")
-            print("  1. Run without --distributed flag for CPU training:")
-            print("     python train_distillation.py ...")
-            print()
-            print("  2. Or ensure CUDA is properly installed and GPUs are available")
-            print()
-            print("=" * 80)
-            sys.exit(1)
-
         # Set default strategy for distributed training if not specified
         if args.teacher_device_strategy is None:
             args.teacher_device_strategy = "auto"
@@ -694,17 +746,17 @@ def main():
     # Exit with error if model couldn't be loaded
     if teacher_wan is None and should_load_teacher:
         if is_main_process(rank):
-            print("\n" + "=" * 80)
-            print("ERROR: Failed to load WAN teacher model")
-            print("=" * 80)
-            print(f"Model path: {args.teacher_path}")
-            print("\nThe WAN teacher model must be available to run distillation training.")
-            print("Please ensure the checkpoint directory contains:")
-            print("  1. models_t5_umt5-xxl-enc-bf16.pth (T5 encoder)")
-            print("  2. Wan2.1_VAE.pth (VAE)")
-            print("  3. low_noise_model/ (DiT low noise)")
-            print("  4. high_noise_model/ (DiT high noise)")
-            print("=" * 80)
+            print("\n" + "=" * 80, file=sys.stderr)
+            print("ERROR: Failed to load WAN teacher model", file=sys.stderr)
+            print("=" * 80, file=sys.stderr)
+            print(f"Model path: {args.teacher_path}", file=sys.stderr)
+            print("\nThe WAN teacher model must be available to run distillation training.", file=sys.stderr)
+            print("Please ensure the checkpoint directory contains:", file=sys.stderr)
+            print("  1. models_t5_umt5-xxl-enc-bf16.pth (T5 encoder)", file=sys.stderr)
+            print("  2. Wan2.1_VAE.pth (VAE)", file=sys.stderr)
+            print("  3. low_noise_model/ (DiT low noise)", file=sys.stderr)
+            print("  4. high_noise_model/ (DiT high noise)", file=sys.stderr)
+            print("=" * 80, file=sys.stderr)
         if args.distributed:
             cleanup_distributed()
         sys.exit(1)
@@ -976,44 +1028,44 @@ def main():
             
             except torch.cuda.OutOfMemoryError as e:
                 # Print error message from all ranks to ensure visibility
-                print("=" * 80)
-                print(f"[Rank {rank}] ERROR: CUDA Out of Memory!")
-                print("=" * 80)
-                print()
+                print("=" * 80, file=sys.stderr)
+                print(f"[Rank {rank}] ERROR: CUDA Out of Memory!", file=sys.stderr)
+                print("=" * 80, file=sys.stderr)
+                print(file=sys.stderr)
                 if torch.cuda.is_available():
                     print_gpu_memory_summary(rank, "Current")
-                    print()
+                    print(file=sys.stderr)
                 
                 if is_main_process(rank):
-                    print("The model or batch size is too large for available GPU memory.")
-                    print()
-                    print("Memory-saving solutions (try in order):")
-                    print(f"  1. Load teacher on CPU (recommended - frees ~120GB GPU memory):")
-                    print(f"     Add --teacher_on_cpu flag")
-                    print()
-                    print(f"  2. Use lower precision for teacher (saves ~50% memory):")
-                    print(f"     Add --teacher_dtype float16 or --teacher_dtype bfloat16")
-                    print()
-                    print(f"  3. Reduce batch size (current: {args.batch_size}):")
-                    print(f"     --batch_size {max(1, args.batch_size // 2)}")
-                    print()
-                    print("  4. Reduce model size in config/student_config.json:")
-                    print("     - hidden_size: 512 (from 1024)")
-                    print("     - depth: 8 (from 16)")
-                    print("     - image_size: 512 (from 1024)")
-                    print()
-                    print("  5. Enable gradient checkpointing:")
-                    print("     Add --gradient_checkpointing flag")
-                    print()
-                    print("  6. Set environment variable for better memory management:")
-                    print("     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
-                    print()
-                    print("Example command with memory optimizations:")
-                    print("  torchrun --nproc_per_node=1 train_distillation.py \\")
-                    print("    --teacher_on_cpu --teacher_dtype float16 \\")
-                    print("    --batch_size 1 --distributed [other args...]")
-                    print()
-                    print("=" * 80)
+                    print("The model or batch size is too large for available GPU memory.", file=sys.stderr)
+                    print(file=sys.stderr)
+                    print("Memory-saving solutions (try in order):", file=sys.stderr)
+                    print(f"  1. Load teacher on CPU (recommended - frees ~120GB GPU memory):", file=sys.stderr)
+                    print(f"     Add --teacher_on_cpu flag", file=sys.stderr)
+                    print(file=sys.stderr)
+                    print(f"  2. Use lower precision for teacher (saves ~50% memory):", file=sys.stderr)
+                    print(f"     Add --teacher_dtype float16 or --teacher_dtype bfloat16", file=sys.stderr)
+                    print(file=sys.stderr)
+                    print(f"  3. Reduce batch size (current: {args.batch_size}):", file=sys.stderr)
+                    print(f"     --batch_size {max(1, args.batch_size // 2)}", file=sys.stderr)
+                    print(file=sys.stderr)
+                    print("  4. Reduce model size in config/student_config.json:", file=sys.stderr)
+                    print("     - hidden_size: 512 (from 1024)", file=sys.stderr)
+                    print("     - depth: 8 (from 16)", file=sys.stderr)
+                    print("     - image_size: 512 (from 1024)", file=sys.stderr)
+                    print(file=sys.stderr)
+                    print("  5. Enable gradient checkpointing:", file=sys.stderr)
+                    print("     Add --gradient_checkpointing flag", file=sys.stderr)
+                    print(file=sys.stderr)
+                    print("  6. Set environment variable for better memory management:", file=sys.stderr)
+                    print("     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", file=sys.stderr)
+                    print(file=sys.stderr)
+                    print("Example command with memory optimizations:", file=sys.stderr)
+                    print("  torchrun --nproc_per_node=1 train_distillation.py \\", file=sys.stderr)
+                    print("    --teacher_on_cpu --teacher_dtype float16 \\", file=sys.stderr)
+                    print("    --batch_size 1 --distributed [other args...]", file=sys.stderr)
+                    print(file=sys.stderr)
+                    print("=" * 80, file=sys.stderr)
                 
                 # In distributed mode, synchronize all processes before exiting
                 if args.distributed:
@@ -1028,9 +1080,9 @@ def main():
             
             except Exception as e:
                 # Print error from all ranks for visibility in distributed training
-                print(f"[Rank {rank}] ERROR during training step: {e}")
+                print(f"[Rank {rank}] ERROR during training step: {e}", file=sys.stderr)
                 import traceback
-                traceback.print_exc()
+                traceback.print_exc(file=sys.stderr)
                 
                 # In distributed mode, synchronize all processes before exiting
                 if args.distributed:
