@@ -343,7 +343,9 @@ class WanLiteStudent(nn.Module):
 
         # 3. Text Embedding Projection
         # Average pool the text embeddings to get a single vector per batch
-        text_emb = self.text_proj(encoder_hidden_states.mean(dim=1))
+        # Cast input to the layer's weight dtype to handle mixed precision from the teacher.
+        text_input_for_proj = encoder_hidden_states.mean(dim=1).to(dtype=self.text_proj.weight.dtype)
+        text_emb = self.text_proj(text_input_for_proj)
 
         # 4. Transformer Processing (2D spatial attention only)
         # Reshape x for transformer: (batch, channels, h, w) -> (batch, h*w, channels)
@@ -904,13 +906,23 @@ def main():
                     patch_size = teacher_wan.patch_size
                     seq_len = (F // patch_size[0]) * (H // patch_size[1]) * (W // patch_size[2])
                     
+                    # Expand timesteps to match the teacher's expectation for a 2D tensor.
+                    # The teacher model has an issue handling 1D timestep tensors, so we
+                    # expand it here to [batch_size, seq_len] to avoid the error.
+                    if timesteps_teacher.dim() == 1:
+                        timesteps_teacher = timesteps_teacher.unsqueeze(1).expand(-1, seq_len)
+
                     # 7. Pass through teacher model
-                    teacher_output_list = teacher_model(
-                        x=teacher_latents_list,
-                        t=timesteps_teacher,
-                        context=text_embeddings_teacher,
-                        seq_len=seq_len,
-                    )
+                    # Use autocast for mixed precision to handle dtype mismatches inside the teacher model.
+                    # The teacher model internally uses float32 for some operations (like time embeddings)
+                    # which can clash with the model's bfloat16/float16 weights if not handled.
+                    with torch.autocast(device_type=teacher_device.type, dtype=teacher_dtype):
+                        teacher_output_list = teacher_model(
+                            x=teacher_latents_list,
+                            t=timesteps_teacher,
+                            context=text_embeddings_teacher,
+                            seq_len=seq_len,
+                        )
                     
                     # 8. Convert output list back to batch tensor and remove temporal dim if 1-frame
                     # Output is list of [C, F, H, W], stack to [B, C, F, H, W]
