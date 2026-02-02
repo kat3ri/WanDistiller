@@ -204,7 +204,7 @@ Memory-saving solutions (try in order):
 **Solutions:**
 Try these in order:
 
-1. **Load teacher on CPU** (saves ~12GB GPU memory):
+1. **Load teacher on CPU** (saves ~120GB GPU memory):
    ```bash
    torchrun --nproc_per_node=1 train_distillation.py \
      --teacher_on_cpu \
