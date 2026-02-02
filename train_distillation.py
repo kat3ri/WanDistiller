@@ -9,8 +9,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
-from diffusers import DiffusionPipeline
+from torch.utils.data import DataLoader, Dataset
+from diffusers import DiffusionPipeline, WanPipeline, AutoencoderKLWan
 from safetensors.torch import save_file
 
 from projection_mapper import load_and_project_weights
@@ -54,6 +54,20 @@ def check_command_line_usage():
 # -----------------------------------------------------------------------------
 # Multi-GPU / Distributed Training Setup
 # -----------------------------------------------------------------------------
+
+def is_main_process(rank):
+    """
+    Check if current process is the main process (rank 0).
+    """
+    return rank == 0
+
+
+def cleanup_distributed():
+    """
+    Clean up distributed training process group.
+    """
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 def setup_distributed():
     """
@@ -114,14 +128,6 @@ def setup_distributed():
     return rank, world_size, local_rank
 
 
-def cleanup_distributed():
-    """
-    Clean up distributed training process group.
-    """
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
 def print_gpu_memory_summary(rank=0, prefix=""):
     """
     Print GPU memory usage summary for debugging OOM issues.
@@ -140,18 +146,11 @@ def print_gpu_memory_summary(rank=0, prefix=""):
         print(f"  Free: {total - allocated:.2f} GB")
 
 
-def is_main_process(rank):
-    """
-    Check if current process is the main process (rank 0).
-    """
-    return rank == 0
-
-
 # -----------------------------------------------------------------------------
 # Dataset Configuration
 # -----------------------------------------------------------------------------
 
-class StaticPromptsDataset(torch.utils.data.Dataset):
+class StaticPromptsDataset(Dataset):
     """
     Dataset to load prompts from a text file.
     """
@@ -246,6 +245,10 @@ class WanLiteStudent(nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         # Default to cuda if available, otherwise cpu
         if device is None:
+            if distributed:
+                # In a distributed setting, device should NOT be None.
+                # It should be explicitly passed as cuda:local_rank.
+                raise ValueError("Device must be specified for distributed training.")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
@@ -439,7 +442,7 @@ def load_config(json_path):
 def main():
     # 0. Check for common command-line usage mistakes
     check_command_line_usage()
-    
+
     # 1. Argument Parsing
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher_path", type=str, required=True)
@@ -477,20 +480,35 @@ def main():
                         help="Data type for teacher model (float16/bfloat16 use less memory)")
 
     args = parser.parse_args()
+
+    # 2. Setup Distributed Training & Device
+    # This must be done after parsing args but before using rank or device.
+    is_distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
+    args.distributed = is_distributed  # Override CLI arg with environment truth
+
+    if args.distributed:
+        rank, world_size, local_rank = setup_distributed()
+        device = torch.device(f"cuda:{local_rank}")
+        if is_main_process(rank):
+            print(f"Distributed training enabled. Rank: {rank}, World Size: {world_size}, Device: {device}")
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if is_main_process(rank):
+            print(f"Single-process training. Device: {device}")
     
+    # 3. Validate and Finalize Arguments
     # Handle backward compatibility: --teacher_on_cpu sets strategy to cpu
     if args.teacher_on_cpu and args.teacher_device_strategy is None:
         args.teacher_device_strategy = "cpu"
     elif args.teacher_on_cpu and args.teacher_device_strategy != "cpu":
-        print("Warning: Both --teacher_on_cpu and --teacher_device_strategy specified. Using --teacher_device_strategy.")
-    
-    # Set default strategy for distributed training
-    if args.distributed and args.teacher_device_strategy is None:
-        args.teacher_device_strategy = "auto"  # Will choose best strategy automatically
-    
-    # 2. Early validation for distributed training
+        if is_main_process(rank):
+            print("Warning: Both --teacher_on_cpu and --teacher_device_strategy specified. Using --teacher_device_strategy.")
+
     if args.distributed:
-        # Check if CUDA is available
+        # Check if CUDA is available (already partially checked in setup_distributed)
         if not torch.cuda.is_available():
             print("=" * 80)
             print("ERROR: Distributed training requires CUDA")
@@ -507,6 +525,10 @@ def main():
             print()
             print("=" * 80)
             sys.exit(1)
+
+        # Set default strategy for distributed training if not specified
+        if args.teacher_device_strategy is None:
+            args.teacher_device_strategy = "auto"
         
         # Validate teacher device strategy
         num_gpus = torch.cuda.device_count()
@@ -520,7 +542,7 @@ def main():
                 args.teacher_device_strategy = "cpu"
                 if is_main_process(rank):
                     print(f"Auto-selected teacher_device_strategy: cpu (only {num_gpus} GPU available)")
-        
+
         # Print selected strategy
         if is_main_process(rank):
             print("=" * 80)
@@ -537,50 +559,7 @@ def main():
                 print("  - Teacher will be loaded on GPU 0 only")
                 print("  - Other ranks will receive teacher outputs via broadcast")
                 print("  - NOTE: This requires implementing output broadcasting")
-            print("=" * 80)
-        
-        # Early check for GPU count vs requested processes
-        num_gpus = torch.cuda.device_count()
-        if 'LOCAL_WORLD_SIZE' in os.environ:
-            requested_procs = int(os.environ['LOCAL_WORLD_SIZE'])
-            if requested_procs > num_gpus:
-                print("=" * 80)
-                print("ERROR: Insufficient GPUs for requested processes")
-                print("=" * 80)
-                print()
-                print(f"You are trying to launch {requested_procs} processes (--nproc_per_node={requested_procs})")
-                print(f"but only {num_gpus} GPU(s) are available on this machine.")
-                print()
-                print("Each process needs its own GPU for distributed training.")
-                print()
-                print("Solutions:")
-                print(f"  1. Reduce the number of processes to match available GPUs:")
-                print(f"     torchrun --nproc_per_node={num_gpus} train_distillation.py ... --distributed")
-                print()
-                print("  2. Or run without distributed training:")
-                print("     python train_distillation.py ... (without --distributed flag)")
-                print()
-                if num_gpus > 1:
-                    print(f"  3. Or use DataParallel with --multi_gpu (no torchrun needed):")
-                    print(f"     python train_distillation.py ... --multi_gpu")
-                    print()
-                print("=" * 80)
-                sys.exit(1)
-    
-    # 3. Setup distributed training if enabled
-    rank = 0
-    world_size = 1
-    local_rank = args.local_rank
-    
-    if args.distributed:
-        rank, world_size, local_rank = setup_distributed()
-        device = torch.device(f"cuda:{local_rank}")
-        print(f"[Rank {rank}] Distributed training initialized: world_size={world_size}, local_rank={local_rank}")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if args.multi_gpu and torch.cuda.device_count() > 1:
-            print(f"Multi-GPU training enabled with {torch.cuda.device_count()} GPUs using DataParallel")
-        print(f"Using device: {device}")
+            print("=" * 80)    
     
     # 4. Load Configuration
     student_config = load_config(args.student_config)
@@ -653,11 +632,12 @@ def main():
     # In environments without network access or when the model is not cached,
     # we'll use a mock teacher model instead
     if should_load_teacher:
+        from huggingface_hub.utils import LocalEntryNotFoundError
         try:
             # First try local_files_only to avoid network timeout
             if is_main_process(rank):
                 print("   Trying local cache first...")
-
+    
             # Suppress warnings about tied weights in T5/UMT5 models
             # These warnings are expected and harmless - encoder.embed_tokens.weight
             # is tied to shared.weight, so the "MISSING" warning is misleading
@@ -665,7 +645,7 @@ def main():
                 warnings.filterwarnings("ignore", message=".*were not used when initializing.*")
                 warnings.filterwarnings("ignore", message=".*were newly initialized.*")
 
-                # Memory optimization: Configure teacher model dtype and device
+                # 1. Load from local cache
                 load_kwargs = {
                     "local_files_only": True,
                 }
@@ -693,8 +673,30 @@ def main():
 
                 if is_main_process(rank):
                     print(f"   Loading pipeline components (this may take a few minutes)...")
-                teacher_pipe = DiffusionPipeline.from_pretrained(
+                
+                # The VAE is small and doesn't support 'balanced' sharding.
+                # We create separate kwargs for it to load it on the current device.
+                vae_load_kwargs = load_kwargs.copy()
+                if vae_load_kwargs.get("device_map") == "balanced":
+                    if is_main_process(rank):
+                        print("   Note: VAE does not support 'balanced' loading. Loading on each rank's device instead.")
+                    del vae_load_kwargs["device_map"]
+
+                # Correctly load the Wan pipeline by first loading the VAE
+                vae = AutoencoderKLWan.from_pretrained(
                     args.teacher_path,
+                    subfolder="vae",
+                    **vae_load_kwargs
+                )
+
+                # If VAE was loaded without device_map (because of 'balanced' strategy),
+                # ensure it's on the correct device for this rank.
+                if load_kwargs.get("device_map") == "balanced":
+                    vae.to(device)
+
+                teacher_pipe = WanPipeline.from_pretrained(
+                    args.teacher_path,
+                    vae=vae,
                     **load_kwargs
                 )
 
@@ -718,11 +720,12 @@ def main():
                 print("   Note: T5/UMT5 models use tied weights (shared.weight ↔ encoder.embed_tokens.weight)")
                 print("         Any 'MISSING' warnings for embed_tokens are expected and can be ignored.")
 
-        except Exception as e:
+        except LocalEntryNotFoundError as e:
             if is_main_process(rank):
-                print(f"   Could not load from local cache: {str(e)[:100]}")
+                print(f"   Model not found in local cache. Attempting to download from HuggingFace Hub...")
+
             try:
-                # Try with network access (if available)
+                # 2. If not in cache, download from Hub
                 if is_main_process(rank):
                     print("   Trying to download from HuggingFace Hub...")
 
@@ -759,8 +762,30 @@ def main():
 
                     if is_main_process(rank):
                         print(f"   Loading pipeline components (this may take a few minutes)...")
-                    teacher_pipe = DiffusionPipeline.from_pretrained(
+                    
+                    # The VAE is small and doesn't support 'balanced' sharding.
+                    # We create separate kwargs for it to load it on the current device.
+                    vae_load_kwargs = load_kwargs.copy()
+                    if vae_load_kwargs.get("device_map") == "balanced":
+                        if is_main_process(rank):
+                            print("   Note: VAE does not support 'balanced' loading. Loading on each rank's device instead.")
+                        del vae_load_kwargs["device_map"]
+
+                    # Correctly load the Wan pipeline by first loading the VAE
+                    vae = AutoencoderKLWan.from_pretrained(
                         args.teacher_path,
+                        subfolder="vae",
+                        **vae_load_kwargs
+                    )
+
+                    # If VAE was loaded without device_map (because of 'balanced' strategy),
+                    # ensure it's on the correct device for this rank.
+                    if load_kwargs.get("device_map") == "balanced":
+                        vae.to(device)
+
+                    teacher_pipe = WanPipeline.from_pretrained(
+                        args.teacher_path,
+                        vae=vae,
                         **load_kwargs
                     )
 
@@ -787,7 +812,7 @@ def main():
 
             except Exception as e2:
                 if is_main_process(rank):
-                    print(f"   Could not download: {str(e2)[:100]}")
+                    print(f"   Could not download model: {str(e2)}")
                 teacher_pipe = None
     else:
         # Ranks that don't load teacher

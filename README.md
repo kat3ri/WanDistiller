@@ -63,7 +63,7 @@ Once the test passes, train with actual model weights:
 ```bash
 # Single GPU training
 python train_distillation.py \
-    --teacher_path "timbrooks/instruct-wan" \
+    --teacher_path "Wan-AI/Wan2.2-T2V-A14B-Diffusers" \
     --student_config "config/student_config.json" \
     --data_path "data/static_prompts.txt" \
     --output_dir "./outputs/wan_t2i" \
@@ -73,7 +73,7 @@ python train_distillation.py \
 
 # Multi-GPU training (recommended for faster training)
 torchrun --nproc_per_node=4 train_distillation.py \
-    --teacher_path "timbrooks/instruct-wan" \
+    --teacher_path "Wan-AI/Wan2.2-T2V-A14B-Diffusers" \
     --student_config "config/student_config.json" \
     --data_path "data/static_prompts.txt" \
     --output_dir "./outputs/wan_t2i" \
