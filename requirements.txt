@@ -6,3 +6,5 @@ safetensors>=0.3.1
 xformers>=0.0.23 # Optional, for memory efficiency
 tqdm>=4.65.0
 ftfy
+easydict>=1.9  # Required for WAN configs
+einops>=0.6.0  # Required for WAN VAE
