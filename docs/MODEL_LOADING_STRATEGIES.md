@@ -78,33 +78,30 @@ python train_distillation.py \
 - Requires large GPU memory (~140GB+ for Wan 2.2)
 - May not work on consumer GPUs
 
-## Strategy 3: Balanced Loading (Multi-GPU)
+## Strategy 3: Balanced Loading (Multi-GPU) ✅ IMPLEMENTED
 
 Automatically distribute the model across multiple GPUs using the "balanced" device_map strategy.
 
 ### Usage
 
-To implement balanced loading, modify `train_distillation.py`:
-
-```python
-# In load_kwargs section
-if args.multi_gpu_teacher:
-    # Automatically balance model across all available GPUs
-    load_kwargs["device_map"] = "balanced"
-else:
-    # Current implementation
-    ...
-```
-
-### Command Line
-
 ```bash
-python train_distillation.py \
-    --multi_gpu_teacher \  # New flag needed
+# Distributed training with balanced teacher loading
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy balanced \
     --teacher_path "timbrooks/instruct-wan" \
     --student_config "config/student_config.json" \
     --data_path "data/static_prompts.txt" \
-    --output_dir "./outputs/wan_t2i"
+    --output_dir "./outputs/wan_t2i" \
+    --distributed
+
+# Or use auto-selection (selects balanced with 2+ GPUs)
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy auto \
+    --teacher_path "timbrooks/instruct-wan" \
+    --student_config "config/student_config.json" \
+    --data_path "data/static_prompts.txt" \
+    --output_dir "./outputs/wan_t2i" \
+    --distributed
 ```
 
 ### How It Works
@@ -112,6 +109,7 @@ python train_distillation.py \
 - Accelerate library automatically distributes layers across GPUs
 - Balances memory usage across all available GPUs
 - Minimizes inter-GPU communication
+- Each rank loads its portion of the teacher model
 
 ### Pros/Cons
 
@@ -119,9 +117,10 @@ python train_distillation.py \
 - Automatic distribution - no manual configuration
 - Works across multiple GPUs
 - Better memory utilization than single GPU
+- Fast inference (all on GPU)
 
 ❌ **Cons:**
-- Requires multiple GPUs
+- Requires multiple GPUs with adequate memory
 - Some inter-GPU communication overhead
 - May not be perfectly optimized for all models
 
@@ -330,43 +329,73 @@ python train_distillation.py \
 ## Current Implementation Status
 
 ### ✅ Implemented
-- [x] CPU Loading (`--teacher_on_cpu`)
-- [x] GPU Loading (default)
+- [x] CPU Loading (`--teacher_device_strategy cpu` or legacy `--teacher_on_cpu`)
+- [x] GPU Loading (default for non-distributed)
+- [x] Balanced multi-GPU loading (`--teacher_device_strategy balanced`)
+- [x] GPU0 single GPU loading (`--teacher_device_strategy gpu0`)
+- [x] Automatic strategy selection (`--teacher_device_strategy auto`)
 - [x] FP16/BF16 precision reduction (`--teacher_dtype`)
 - [x] Low memory usage optimization
 
 ### 🚧 To Be Implemented
-- [ ] Balanced multi-GPU loading (`--balanced_teacher`)
-- [ ] Sequential multi-GPU loading (`--sequential_teacher`)
-- [ ] Custom device mapping
-- [ ] Model offloading with cpu_offload
-- [ ] Disk-based sharding
-- [ ] Automatic strategy selection based on available hardware
+- [ ] Sequential multi-GPU loading (`--sequential` strategy)
+- [ ] Custom device mapping (dict-based configuration)
+- [ ] Model offloading with cpu_offload (on-demand loading)
+- [ ] Disk-based sharding (for extremely large models)
+- [ ] Teacher output broadcasting for gpu0 strategy
+
+## Using Implemented Strategies
+
+### CPU Loading
+```bash
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy cpu \
+    --distributed \
+    ...
+```
+
+### Balanced Loading
+```bash
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy balanced \
+    --distributed \
+    ...
+```
+
+### Auto Selection
+```bash
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy auto \
+    --distributed \
+    ...
+```
 
 ## Adding New Loading Strategies
 
 To add a new loading strategy:
 
-1. **Add Command Line Flag** (in `train_distillation.py`):
+1. **Add to choices in argument parser**:
 ```python
-parser.add_argument("--balanced_teacher", action="store_true",
-                    help="Balance teacher model across all available GPUs")
+parser.add_argument("--teacher_device_strategy", type=str, default=None,
+                    choices=["cpu", "balanced", "gpu0", "auto", "sequential"],  # Add new strategy
+                    help="Strategy for loading teacher model")
 ```
 
 2. **Update load_kwargs Logic**:
 ```python
-if args.balanced_teacher and torch.cuda.device_count() > 1:
-    load_kwargs["device_map"] = "balanced"
-elif args.teacher_on_cpu:
+if args.teacher_device_strategy == "cpu":
     load_kwargs["low_cpu_mem_usage"] = True
+elif args.teacher_device_strategy == "balanced":
+    load_kwargs["device_map"] = "balanced"
+elif args.teacher_device_strategy == "sequential":
+    load_kwargs["device_map"] = "sequential"  # New strategy
 # ... other strategies
 ```
 
-3. **Update Device Movement Logic**:
+3. **Update should_load_teacher Logic** (if needed):
 ```python
-# Skip .to(device) if using device_map
-if "device_map" not in load_kwargs:
-    teacher_pipe.to(device)
+if args.teacher_device_strategy == "sequential":
+    should_load_teacher = True  # All ranks participate
 ```
 
 4. **Test the Strategy**:

@@ -1,4 +1,4 @@
-# Summary of Changes: CPU Loading and Distributed Training Fixes
+# Summary of Changes: CPU Loading and Distributed Training Improvements
 
 ## Issues Fixed
 
@@ -11,7 +11,7 @@
 
 **Location:** `train_distillation.py` lines 613, 662
 
-### Issue 2: Distributed Training Memory Waste (NEW DISCOVERY)
+### Issue 2: Distributed Training Memory Waste
 **Problem:** Each GPU process was loading its own full copy of the 120GB teacher model.
 
 **Impact:** With 4 GPUs → 480GB GPU memory wasted!
@@ -19,35 +19,60 @@
 **Root Cause:** Teacher loading code executed on all ranks without conditional logic.
 
 **Fix:** 
-- Only rank 0 loads teacher when not using `--teacher_on_cpu`
-- When `--teacher_on_cpu` is set, all ranks share the CPU copy
-- Added requirement: Distributed training must use `--teacher_on_cpu` flag
+- Implemented flexible teacher device strategies
+- CPU: All ranks share CPU copy
+- Balanced: Distribute teacher across GPUs
+- GPU0: Only rank 0 loads teacher
+- Auto: Automatically select best strategy
 
 **Memory Savings:**
 - Before: 4 GPUs × 130GB = 520GB total
-- After: 40GB GPU + 120GB RAM = 160GB total  
+- After with CPU: 40GB GPU + 120GB RAM = 160GB total  
+- After with Balanced: 4 GPUs × 40GB = 160GB total
 - **Saved: 360GB!**
+
+### Issue 3: Inflexible Distributed Training
+**Problem:** Distributed training required `--teacher_on_cpu`, limiting options.
+
+**User Request:** "i want to make sure balanced or 'load on gpu 0, train on gpus 1-n' are still options"
+
+**Fix:**
+- Removed hard requirement for `--teacher_on_cpu`
+- Added `--teacher_device_strategy` with multiple options
+- Implemented balanced and gpu0 strategies
+- Added auto-selection for ease of use
 
 ## Code Changes
 
 ### train_distillation.py
 
-1. **CPU Loading (lines 612-618, 667-673, 680-686, 700-706)**
-   - Changed `device_map="cpu"` to `low_cpu_mem_usage=True`
-   - Updated device movement logic
-   - Fixed device comparison to use `device.type != "cpu"`
+1. **New Argument: --teacher_device_strategy (lines 467-495)**
+   - Added choices: `cpu`, `balanced`, `gpu0`, `auto`
+   - Backward compatibility with `--teacher_on_cpu`
+   - Auto-selection logic for distributed training
 
-2. **Distributed Training (lines 476-514, 575-595)**
-   - Added validation requiring `--teacher_on_cpu` for distributed mode
-   - Added conditional teacher loading: `should_load_teacher = (not args.distributed) or (rank == 0) or args.teacher_on_cpu`
-   - Only ranks that should load teacher actually load it
+2. **Updated Validation (lines 493-548)**
+   - Removed hard requirement for `--teacher_on_cpu`
+   - Added strategy selection and validation
+   - Auto-select balanced with 2+ GPUs, cpu with 1 GPU
+   - Display selected strategy to user
 
-3. **Teacher Model Initialization (lines 767-808)**
-   - Added guards: `if teacher_pipe is not None:`
-   - Fixed duplicate code (teacher_model assignment)
-   - Handle case where teacher_pipe is None on some ranks
+3. **Flexible Teacher Loading (lines 621-650)**
+   - CPU strategy: All ranks load/share
+   - Balanced strategy: All ranks participate in distribution
+   - GPU0 strategy: Only rank 0 loads
+   - Updated `should_load_teacher` logic for each strategy
 
-4. **Projection Layer Creation (lines 812-855)**
+4. **Device Map Configuration (lines 668-696, 740-768)**
+   - CPU: `low_cpu_mem_usage=True`
+   - Balanced: `device_map="balanced"`
+   - GPU0: `device_map={"": "cuda:0"}`
+   - Applied to both local and network loading paths
+
+5. **Device Placement Logic (lines 701-714, 767-780)**
+   - Updated to handle each strategy appropriately
+   - Skip redundant .to() calls when device_map is used
+   - Proper messages for each strategy
    - Only create projection layer when teacher_model exists
    - Set defaults for ranks without teacher model
 
