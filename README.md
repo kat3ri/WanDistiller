@@ -247,26 +247,55 @@ The `projection_mapper.py` converts teacher weights:
 If you encounter CUDA Out of Memory errors during distributed training:
 
 ```bash
-# RECOMMENDED: Load teacher on CPU (saves ~120GB GPU memory)
-torchrun --nproc_per_node=1 train_distillation.py \
-    --teacher_on_cpu \
-    --batch_size 1 \
+# OPTION 1: Balanced loading (distribute teacher across GPUs)
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy balanced \
+    --batch_size 2 \
+    --distributed \
+    [other args...]
+
+# OPTION 2: Load teacher on CPU (saves ~120GB GPU memory per GPU)
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy cpu \
+    --batch_size 2 \
+    --distributed \
+    [other args...]
+
+# OPTION 3: Load teacher on GPU 0 only (requires output broadcasting - experimental)
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy gpu0 \
+    --batch_size 2 \
+    --distributed \
+    [other args...]
+
+# OPTION 4: Auto-select best strategy (recommended for beginners)
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy auto \
+    --batch_size 2 \
     --distributed \
     [other args...]
 
 # Alternative: Use lower precision for teacher (saves ~50% memory)
-torchrun --nproc_per_node=1 train_distillation.py \
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy balanced \
     --teacher_dtype float16 \
-    --batch_size 1 \
+    --batch_size 2 \
     --distributed \
     [other args...]
 
 # Combine multiple memory optimizations for maximum savings
-torchrun --nproc_per_node=1 train_distillation.py \
-    --teacher_on_cpu \
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_device_strategy cpu \
     --teacher_dtype float16 \
     --batch_size 1 \
     --gradient_checkpointing \
+    --distributed \
+    [other args...]
+
+# Backward compatibility: --teacher_on_cpu still works
+torchrun --nproc_per_node=4 train_distillation.py \
+    --teacher_on_cpu \
+    --batch_size 2 \
     --distributed \
     [other args...]
 
@@ -299,15 +328,22 @@ torchrun --nproc_per_node=2 train_distillation.py --distributed [other args...]
 # - "image_size": 512 (reduce from 1024)
 ```
 
+**Teacher Device Strategies for Distributed Training:**
+- `--teacher_device_strategy cpu`: Load teacher on CPU (shared by all ranks), saves GPU memory
+- `--teacher_device_strategy balanced`: Distribute teacher across all GPUs, best for multiple GPUs
+- `--teacher_device_strategy gpu0`: Load teacher on GPU 0 only (experimental, requires broadcasting)
+- `--teacher_device_strategy auto`: Automatically select best strategy (default for distributed)
+- `--teacher_on_cpu`: Deprecated but still supported, equivalent to `--teacher_device_strategy cpu`
+
 **Memory-Saving Options:**
-- `--teacher_on_cpu`: Load teacher model on CPU instead of GPU (saves ~120GB VRAM, slightly slower inference)
 - `--teacher_dtype float16`: Use FP16 for teacher model (saves ~50% memory)
 - `--teacher_dtype bfloat16`: Use BF16 for teacher model (saves ~50% memory, better numerical stability than FP16)
 - `--gradient_checkpointing`: Trade compute for memory in student model
 
 **Memory Usage Tips:**
 - **Teacher model is the biggest memory consumer** (~120GB in FP32)
-- Each GPU process loads both teacher and student models
+- Use `balanced` strategy to distribute teacher across multiple GPUs
+- Use `cpu` strategy if you have limited GPU memory but sufficient RAM
 - Larger batch sizes require more memory
 - Larger image_size increases memory usage quadratically
 - Gradient checkpointing reduces memory by ~40% but slows training by ~20%

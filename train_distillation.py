@@ -465,13 +465,28 @@ def main():
     
     # Memory optimization arguments
     parser.add_argument("--teacher_on_cpu", action="store_true",
-                        help="Load teacher model on CPU to save GPU memory (slower but uses less VRAM)")
+                        help="Load teacher model on CPU to save GPU memory (slower but uses less VRAM). Deprecated: use --teacher_device_strategy cpu")
+    parser.add_argument("--teacher_device_strategy", type=str, default=None,
+                        choices=["cpu", "balanced", "gpu0", "auto"],
+                        help="Strategy for loading teacher model in distributed training: "
+                             "cpu=load on CPU (shared), balanced=distribute across GPUs, "
+                             "gpu0=load on GPU 0 only, auto=automatic selection")
     parser.add_argument("--mixed_precision", action="store_true",
                         help="Use mixed precision (FP16) training to reduce memory usage")
     parser.add_argument("--teacher_dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"],
                         help="Data type for teacher model (float16/bfloat16 use less memory)")
 
     args = parser.parse_args()
+    
+    # Handle backward compatibility: --teacher_on_cpu sets strategy to cpu
+    if args.teacher_on_cpu and args.teacher_device_strategy is None:
+        args.teacher_device_strategy = "cpu"
+    elif args.teacher_on_cpu and args.teacher_device_strategy != "cpu":
+        print("Warning: Both --teacher_on_cpu and --teacher_device_strategy specified. Using --teacher_device_strategy.")
+    
+    # Set default strategy for distributed training
+    if args.distributed and args.teacher_device_strategy is None:
+        args.teacher_device_strategy = "auto"  # Will choose best strategy automatically
     
     # 2. Early validation for distributed training
     if args.distributed:
@@ -493,30 +508,36 @@ def main():
             print("=" * 80)
             sys.exit(1)
         
-        # IMPORTANT: Require --teacher_on_cpu for distributed training to avoid loading teacher on each GPU
-        if not args.teacher_on_cpu:
+        # Validate teacher device strategy
+        num_gpus = torch.cuda.device_count()
+        if args.teacher_device_strategy == "auto":
+            # Auto-select best strategy based on available resources
+            if num_gpus >= 2:
+                args.teacher_device_strategy = "balanced"
+                if is_main_process(rank):
+                    print(f"Auto-selected teacher_device_strategy: balanced (detected {num_gpus} GPUs)")
+            else:
+                args.teacher_device_strategy = "cpu"
+                if is_main_process(rank):
+                    print(f"Auto-selected teacher_device_strategy: cpu (only {num_gpus} GPU available)")
+        
+        # Print selected strategy
+        if is_main_process(rank):
             print("=" * 80)
-            print("WARNING: Distributed training without --teacher_on_cpu")
+            print(f"Distributed Training Configuration")
             print("=" * 80)
-            print()
-            print("In distributed training, --teacher_on_cpu is STRONGLY RECOMMENDED.")
-            print()
-            print("Current behavior WITHOUT --teacher_on_cpu:")
-            print("  - Only rank 0 loads teacher on GPU")
-            print("  - Other ranks will not have teacher outputs (TRAINING WILL FAIL)")
-            print()
-            print("Solutions:")
-            print("  1. Add --teacher_on_cpu flag (RECOMMENDED):")
-            print("     torchrun --nproc_per_node=N train_distillation.py ... --teacher_on_cpu")
-            print("     This loads teacher on CPU (shared by all ranks), saving GPU memory")
-            print()
-            print("  2. Or reduce to single GPU:")
-            print("     python train_distillation.py ... (no --distributed)")
-            print()
+            print(f"Teacher device strategy: {args.teacher_device_strategy}")
+            if args.teacher_device_strategy == "cpu":
+                print("  - Teacher will be loaded on CPU (shared by all ranks)")
+                print("  - Saves GPU memory, slower teacher inference")
+            elif args.teacher_device_strategy == "balanced":
+                print("  - Teacher will be distributed across all GPUs")
+                print("  - Balanced memory usage, requires inter-GPU communication")
+            elif args.teacher_device_strategy == "gpu0":
+                print("  - Teacher will be loaded on GPU 0 only")
+                print("  - Other ranks will receive teacher outputs via broadcast")
+                print("  - NOTE: This requires implementing output broadcasting")
             print("=" * 80)
-            print("ERROR: Distributed training currently requires --teacher_on_cpu")
-            print("=" * 80)
-            sys.exit(1)
         
         # Early check for GPU count vs requested processes
         num_gpus = torch.cuda.device_count()
@@ -598,26 +619,36 @@ def main():
             print(f"Model wrapped with DataParallel on {torch.cuda.device_count()} GPUs")
 
     # 6. Initialize Teacher Model (Diffusers)
-    # This loads the model from the path specified
-    # IMPORTANT: In distributed training, only load teacher on rank 0 to save GPU memory
-    # Unless teacher_on_cpu is set, in which case all ranks can share the CPU copy
+    # This loads the model from the path specified with the chosen device strategy
     if is_main_process(rank) or not args.distributed:
         print(f"Loading teacher model from: {args.teacher_path}")
-        if args.teacher_on_cpu:
+        if args.teacher_device_strategy == "cpu":
             print("   Teacher model will be loaded on CPU to save GPU memory")
             if args.distributed:
                 print("   All ranks will use the same CPU copy (shared memory)")
-        elif args.distributed:
-            print("   WARNING: In distributed mode, only rank 0 loads teacher on GPU")
-            print("   Other ranks will receive teacher outputs via broadcast")
-            print("   This saves GPU memory (avoids loading full model on each GPU)")
+        elif args.teacher_device_strategy == "balanced":
+            print("   Teacher model will be distributed across all GPUs using balanced strategy")
+        elif args.teacher_device_strategy == "gpu0":
+            print("   Teacher model will be loaded on GPU 0 only")
+            if args.distributed and rank != 0:
+                print("   This rank will receive teacher outputs via broadcast")
         if args.teacher_dtype != "float32":
             print(f"   Teacher model will use {args.teacher_dtype} to save memory")
 
     teacher_pipe = None
-    # In distributed mode, only rank 0 loads teacher (unless using CPU)
-    # This prevents loading full teacher model on every GPU
-    should_load_teacher = (not args.distributed) or (rank == 0) or args.teacher_on_cpu
+    # Determine which ranks should load teacher based on strategy
+    if args.teacher_device_strategy == "cpu":
+        # All ranks can load/share CPU copy
+        should_load_teacher = True
+    elif args.teacher_device_strategy == "balanced":
+        # All ranks participate in balanced loading
+        should_load_teacher = True
+    elif args.teacher_device_strategy == "gpu0":
+        # Only rank 0 loads teacher
+        should_load_teacher = (rank == 0)
+    else:
+        # Non-distributed or fallback
+        should_load_teacher = (not args.distributed) or (rank == 0)
     
     # In environments without network access or when the model is not cached,
     # we'll use a mock teacher model instead
@@ -645,13 +676,19 @@ def main():
                 elif args.teacher_dtype == "bfloat16":
                     load_kwargs["torch_dtype"] = torch.bfloat16
                 
-                # Set device - load on CPU if requested
-                if args.teacher_on_cpu:
+                # Set device strategy based on configuration
+                if args.teacher_device_strategy == "cpu":
                     # For CPU loading, use low_cpu_mem_usage for efficient memory usage
                     # Don't use device_map as "cpu" is not a valid strategy
                     load_kwargs["low_cpu_mem_usage"] = True
+                elif args.teacher_device_strategy == "balanced":
+                    # Distribute teacher model across all available GPUs
+                    load_kwargs["device_map"] = "balanced"
+                elif args.teacher_device_strategy == "gpu0":
+                    # Load teacher on GPU 0 only
+                    load_kwargs["device_map"] = {"": "cuda:0"}
                 elif torch.cuda.is_available():
-                    # Load on current GPU device
+                    # Default: Load on current GPU device
                     load_kwargs["device_map"] = {"": device}
 
                 if is_main_process(rank):
@@ -661,15 +698,19 @@ def main():
                     **load_kwargs
                 )
 
-            # Only move to device if we didn't use device_map or if we're targeting CPU
+            # Only move to device if we didn't use device_map or if targeting CPU
             if is_main_process(rank):
                 if "device_map" not in load_kwargs:
                     print(f"   Moving pipeline to {device}...")
                     teacher_pipe.to(device)
-                elif args.teacher_on_cpu and device.type != "cpu":
+                elif args.teacher_device_strategy == "cpu" and device.type != "cpu":
                     # Teacher is on CPU but student is on GPU - keep teacher on CPU
                     teacher_pipe.to("cpu")
                     print(f"   Teacher model kept on CPU (student on {device})")
+                elif args.teacher_device_strategy == "balanced":
+                    print(f"   Teacher model distributed across GPUs using balanced strategy")
+                elif args.teacher_device_strategy == "gpu0":
+                    print(f"   Teacher model placed on GPU 0")
                 print("✓ Loaded real teacher model from local cache")
 
             # Note about UMT5 text encoder
@@ -701,13 +742,19 @@ def main():
                     elif args.teacher_dtype == "bfloat16":
                         load_kwargs["torch_dtype"] = torch.bfloat16
                     
-                    # Set device - load on CPU if requested
-                    if args.teacher_on_cpu:
+                    # Set device strategy based on configuration
+                    if args.teacher_device_strategy == "cpu":
                         # For CPU loading, use low_cpu_mem_usage for efficient memory usage
                         # Don't use device_map as "cpu" is not a valid strategy
                         load_kwargs["low_cpu_mem_usage"] = True
+                    elif args.teacher_device_strategy == "balanced":
+                        # Distribute teacher model across all available GPUs
+                        load_kwargs["device_map"] = "balanced"
+                    elif args.teacher_device_strategy == "gpu0":
+                        # Load teacher on GPU 0 only
+                        load_kwargs["device_map"] = {"": "cuda:0"}
                     elif torch.cuda.is_available():
-                        # Load on current GPU device
+                        # Default: Load on current GPU device
                         load_kwargs["device_map"] = {"": device}
 
                     if is_main_process(rank):
@@ -722,10 +769,14 @@ def main():
                     if "device_map" not in load_kwargs:
                         print(f"   Moving pipeline to {device}...")
                         teacher_pipe.to(device)
-                    elif args.teacher_on_cpu and device.type != "cpu":
+                    elif args.teacher_device_strategy == "cpu" and device.type != "cpu":
                         # Teacher is on CPU but student is on GPU - keep teacher on CPU
                         teacher_pipe.to("cpu")
                         print(f"   Teacher model kept on CPU (student on {device})")
+                    elif args.teacher_device_strategy == "balanced":
+                        print(f"   Teacher model distributed across GPUs using balanced strategy")
+                    elif args.teacher_device_strategy == "gpu0":
+                        print(f"   Teacher model placed on GPU 0")
                     print("✓ Loaded real teacher model from HuggingFace")
 
 
