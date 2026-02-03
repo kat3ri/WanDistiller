@@ -506,26 +506,26 @@ class T5EncoderModel:
             
             logging.info(f'Loading T5 encoder from HuggingFace format: {checkpoint_path}')
             
-            # Determine path to text_encoder
+            # Determine loading parameters
             if os.path.isdir(checkpoint_path):
                 # Local directory with HF structure
                 text_encoder_dir = os.path.join(checkpoint_path, 'text_encoder')
-                if os.path.exists(text_encoder_dir):
-                    hf_model = HF_UMT5EncoderModel.from_pretrained(
-                        text_encoder_dir,
-                        torch_dtype=dtype,
-                        low_cpu_mem_usage=True
-                    )
-                else:
+                if not os.path.exists(text_encoder_dir):
                     raise ValueError(f"text_encoder subfolder not found in {checkpoint_path}")
+                load_path = text_encoder_dir
+                subfolder = None
             else:
                 # HuggingFace model ID
-                hf_model = HF_UMT5EncoderModel.from_pretrained(
-                    checkpoint_path,
-                    subfolder='text_encoder',
-                    torch_dtype=dtype,
-                    low_cpu_mem_usage=True
-                )
+                load_path = checkpoint_path
+                subfolder = 'text_encoder'
+            
+            # Load the model
+            hf_model = HF_UMT5EncoderModel.from_pretrained(
+                load_path,
+                subfolder=subfolder,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True
+            )
             
             # Use HF model directly (it's already encoder-only)
             self.model = hf_model.eval().requires_grad_(False)
@@ -534,15 +534,14 @@ class T5EncoderModel:
                 self.model = shard_fn(self.model, sync_module_states=False)
             else:
                 self.model.to(self.device)
-                
-            # Tokenizer from HF format
+                 
+            # Tokenizer from HF format (check for tokenizer subdirectory)
+            tokenizer_dir = checkpoint_path
             if os.path.isdir(checkpoint_path):
-                tokenizer_dir = os.path.join(checkpoint_path, 'tokenizer')
-                if not os.path.exists(tokenizer_dir):
-                    # Fallback to root directory
-                    tokenizer_dir = checkpoint_path
-            else:
-                tokenizer_dir = checkpoint_path
+                tokenizer_subdir = os.path.join(checkpoint_path, 'tokenizer')
+                if os.path.exists(tokenizer_subdir):
+                    tokenizer_dir = tokenizer_subdir
+            
             self.tokenizer = HuggingfaceTokenizer(
                 name=tokenizer_dir, seq_len=text_len, clean='whitespace')
         else:

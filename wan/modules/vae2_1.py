@@ -657,26 +657,26 @@ class Wan2_1_VAE:
             
             logging.info(f'Loading VAE from HuggingFace format: {vae_pth}')
             
-            # Determine path to VAE
+            # Determine loading parameters
             if os.path.isdir(vae_pth):
                 # Local directory with HF structure
                 vae_dir = os.path.join(vae_pth, 'vae')
-                if os.path.exists(vae_dir):
-                    hf_vae = AutoencoderKLWan.from_pretrained(
-                        vae_dir,
-                        torch_dtype=dtype,
-                        low_cpu_mem_usage=True
-                    )
-                else:
+                if not os.path.exists(vae_dir):
                     raise ValueError(f"vae subfolder not found in {vae_pth}")
+                load_path = vae_dir
+                subfolder = None
             else:
                 # HuggingFace model ID
-                hf_vae = AutoencoderKLWan.from_pretrained(
-                    vae_pth,
-                    subfolder='vae',
-                    torch_dtype=dtype,
-                    low_cpu_mem_usage=True
-                )
+                load_path = vae_pth
+                subfolder = 'vae'
+            
+            # Load the model
+            hf_vae = AutoencoderKLWan.from_pretrained(
+                load_path,
+                subfolder=subfolder,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True
+            )
             
             # Use HF VAE directly
             self.model = hf_vae.eval().requires_grad_(False).to(device)
