@@ -575,6 +575,26 @@ def main():
         if is_main_process(rank):
             print(f"Single-process training. Device: {device}")
     
+    if is_main_process(rank):
+        print("=" * 80)
+        print("Starting WanDistiller Training")
+        print("=" * 80)
+        print("Configuration:")
+        print(f"  - Teacher Model: {args.teacher_path}")
+        print(f"  - Student Config: {args.student_config}")
+        print(f"  - Data Path: {args.data_path}")
+        print(f"  - Output Dir: {args.output_dir}")
+        print(f"  - Batch Size: {args.batch_size} (per GPU)")
+        print(f"  - Epochs: {args.num_epochs}")
+        print(f"  - Learning Rate: {args.lr}")
+        print(f"  - Distributed: {args.distributed}")
+        if args.distributed:
+            print(f"  - World Size: {world_size}")
+        print(f"  - Device: {device}")
+        print(f"  - Teacher Device Strategy: {args.teacher_device_strategy}")
+        print(f"  - Teacher DType: {args.teacher_dtype}")
+        print(f"  - Gradient Checkpointing: {args.gradient_checkpointing}")
+
     # 3. Validate and Finalize Arguments
     # Handle backward compatibility: --teacher_on_cpu sets strategy to cpu
     if args.teacher_on_cpu and args.teacher_device_strategy is None:
@@ -620,9 +640,13 @@ def main():
             print("=" * 80)    
     
     # 4. Load Configuration
+    if is_main_process(rank):
+        print("\n[1/5] Loading configurations...")
     student_config = load_config(args.student_config)
 
     # Safety check to ensure config loaded successfully
+    if is_main_process(rank):
+        print("✓ Student configuration loaded.")
     if student_config is None:
         if is_main_process(rank):
             print("Error: Could not load student configuration.")
@@ -631,6 +655,8 @@ def main():
         return
 
     # 5. Initialize Student Model
+    if is_main_process(rank):
+        print("\n[2/5] Initializing student model...")
     # Initialize with teacher checkpoint path to enable weight projection
     student_model = WanLiteStudent(
         student_config, 
@@ -640,6 +666,12 @@ def main():
         use_gradient_checkpointing=args.gradient_checkpointing
     )
     
+    if is_main_process(rank):
+        print("✓ Student model initialized.")
+        total_params = sum(p.numel() for p in student_model.parameters())
+        trainable_params = sum(p.numel() for p in student_model.parameters() if p.requires_grad)
+        print(f"  - Total parameters: {total_params:,}")
+        print(f"  - Trainable parameters: {trainable_params:,}")
     if is_main_process(rank) and args.gradient_checkpointing:
         print("✓ Gradient checkpointing enabled - trading compute for memory")
     
@@ -657,7 +689,8 @@ def main():
 
     # 6. Initialize Teacher Model using WAN Text2Video
     # This loads the model using WAN's native components with built-in distribution logic
-    if is_main_process(rank) or not args.distributed:
+    if is_main_process(rank):
+        print("\n[3/5] Initializing teacher model...")
         print(f"Loading teacher model from: {args.teacher_path}")
         print("   Using WAN Text2Video native implementation")
         if args.teacher_device_strategy == "cpu":
@@ -739,13 +772,17 @@ def main():
             teacher_wan = None
     else:
         # Ranks that don't load teacher
-        if is_main_process(rank):
-            print(f"[Rank {rank}] Skipping teacher load - will receive outputs from rank 0")
+        if not is_main_process(rank):
+            print(f"[Rank {rank}] Skipping teacher load on this rank.")
         teacher_wan = None
 
     # Exit with error if model couldn't be loaded
     if teacher_wan is None and should_load_teacher:
         if is_main_process(rank):
+            # Add a small delay to ensure other ranks' potential errors are printed first
+            if args.distributed:
+                import time
+                time.sleep(2)
             print("\n" + "=" * 80, file=sys.stderr)
             print("ERROR: Failed to load WAN teacher model", file=sys.stderr)
             print("=" * 80, file=sys.stderr)
@@ -792,7 +829,11 @@ def main():
             print(f"Param dtype: {teacher_wan.param_dtype}")
 
     # 7. Initialize Dataset and Dataloader
+    if is_main_process(rank):
+        print("\n[4/5] Initializing dataset and dataloader...")
     dataset = StaticPromptsDataset(args.data_path)
+    if is_main_process(rank):
+        print(f"✓ Dataset created with {len(dataset)} prompts.")
     
     # Use DistributedSampler for distributed training
     if args.distributed:
@@ -804,6 +845,8 @@ def main():
             num_workers=args.num_workers,  # Configurable number of workers
             pin_memory=True
         )
+        if is_main_process(rank):
+            print(f"✓ DistributedSampler and DataLoader created (batch_size={args.batch_size}, num_workers={args.num_workers}).")
     else:
         dataloader = torch.utils.data.DataLoader(
             dataset, 
@@ -811,15 +854,19 @@ def main():
             shuffle=True,
             num_workers=args.num_workers  # Configurable number of workers
         )
+        if is_main_process(rank):
+            print(f"✓ DataLoader created (batch_size={args.batch_size}, num_workers={args.num_workers}).")
 
     # 8. Optimizer and Loss
-    optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.lr)
+    if is_main_process(rank):
+        print("\n[5/5] Initializing optimizer and loss function...")
     loss_fn = torch.nn.functional.mse_loss
     
     # MEMORY OPTIMIZATION: Pre-create projection layer if needed
     # This avoids recreating it every batch which causes memory leaks
     # Only create on ranks that have the teacher model
     proj_layer = None
+    output_proj_layer = None
     teacher_device = None
     teacher_dtype = None
     # Get VAE z_dim from teacher VAE config if available
@@ -850,6 +897,15 @@ def main():
                 param.requires_grad = False
             if is_main_process(rank):
                 print(f"✓ Projection layer created on {teacher_device} with dtype {teacher_dtype}")
+
+            # Create a trainable projection layer for the student's output to match teacher's channels
+            if is_main_process(rank):
+                print(f"Creating OUTPUT projection layer: {student_channels} -> {vae_z_dim} channels for loss calculation")
+            output_proj_layer = nn.Conv2d(
+                in_channels=student_channels,
+                out_channels=vae_z_dim,
+                kernel_size=1
+            ).to(device)
         
         # Cache teacher device and dtype to avoid repeated parameter iteration
         teacher_device = next(teacher_model.parameters()).device
@@ -861,10 +917,25 @@ def main():
         teacher_device = device
         teacher_dtype = torch.float32
 
+    # Add student's output projection layer parameters to the optimizer if it exists
+    params_to_optimize = list(student_model.parameters())
+    if output_proj_layer is not None:
+        if is_main_process(rank):
+            print("Adding output projection layer parameters to optimizer.")
+        params_to_optimize.extend(output_proj_layer.parameters())
+    optimizer = AdamW(params_to_optimize, lr=args.lr)
+    if is_main_process(rank):
+        print(f"✓ AdamW optimizer initialized (lr={args.lr}).")
+
 
     # 9. Training Loop
     student_model.train()  # Student needs to be in train mode
     global_step = 0
+    training_complete = False
+
+    if is_main_process(rank):
+        print("\n" + "=" * 80)
+        print("Setup complete. Starting training loop...")
 
     if is_main_process(rank):
         print("Starting distillation training...")
@@ -874,11 +945,16 @@ def main():
 
     # Fixed: Use args.num_epochs
     for epoch in range(args.num_epochs):
+        epoch_loss = 0.0
+        num_batches = 0
         # Set epoch for DistributedSampler to ensure different shuffling each epoch
         if args.distributed:
             sampler.set_epoch(epoch)
             
         for batch in dataloader:
+            if global_step >= args.num_steps:
+                training_complete = True
+                break
             try:
                 # --- DATA PREPARATION ---
                 # batch is a list of prompt strings
@@ -948,7 +1024,8 @@ def main():
                     if proj_layer is not None:
                         # Stack to [B, C, F, H, W], apply projection, then unstack
                         teacher_latents_batch = torch.stack(teacher_latents_list)
-                        teacher_latents_batch = proj_layer(teacher_latents_batch)
+                        # Move to teacher device before projection
+                        teacher_latents_batch = proj_layer(teacher_latents_batch.to(device=teacher_device, dtype=teacher_dtype))
                         teacher_latents_list = [teacher_latents_batch[i] for i in range(teacher_latents_batch.shape[0])]
                         del teacher_latents_batch
                     
@@ -1011,6 +1088,10 @@ def main():
                     encoder_hidden_states=text_embeddings,
                 )
 
+                # Project student output to match teacher's channel dimension for loss calculation
+                if output_proj_layer is not None:
+                    student_output = output_proj_layer(student_output)
+
                 # --- LOSS CALCULATION ---
                 loss = loss_fn(student_output, teacher_output)
 
@@ -1023,6 +1104,8 @@ def main():
                 
                 # Save loss value before deleting the tensor
                 loss_value = loss.item()
+                epoch_loss += loss_value
+                num_batches += 1
                 
                 # MEMORY OPTIMIZATION: Explicitly delete tensors and clear cache periodically
                 # Only delete tensors that still exist in scope
@@ -1105,6 +1188,13 @@ def main():
                 
                 # Exit with error code instead of raising to avoid confusing errors
                 sys.exit(1)
+
+        if training_complete:
+            if is_main_process(rank):
+                print(f"Reached max steps ({args.num_steps}). Stopping training.")
+            break
+        if is_main_process(rank) and num_batches > 0:
+            print(f"Epoch {epoch + 1}/{args.num_epochs} complete. Average Loss: {epoch_loss / num_batches:.6f}")
 
     # 10. Save Model (only from main process)
     if is_main_process(rank):

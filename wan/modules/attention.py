@@ -145,6 +145,7 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
+    out_dtype = q.dtype
     if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
         return flash_attention(
             q=q,
@@ -176,4 +177,4 @@ def attention(
             q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
         out = out.transpose(1, 2).contiguous()
-        return out
+        return out.to(out_dtype)
