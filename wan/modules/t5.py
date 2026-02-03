@@ -2,12 +2,20 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .tokenizers import HuggingfaceTokenizer
+
+# Import for HuggingFace format support (optional, only used if HF format is detected)
+try:
+    from transformers import UMT5EncoderModel as HF_UMT5EncoderModel
+    HF_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    HF_TRANSFORMERS_AVAILABLE = False
 
 __all__ = [
     'T5Model',
@@ -479,29 +487,81 @@ class T5EncoderModel:
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
+        is_hf_format=False,
     ):
         self.text_len = text_len
         self.dtype = dtype
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
+        self.is_hf_format = is_hf_format
 
-        # init model
-        model = umt5_xxl(
-            encoder_only=True,
-            return_tokenizer=False,
-            dtype=dtype,
-            device=device).eval().requires_grad_(False)
-        logging.info(f'loading {checkpoint_path}')
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
-        self.model = model
-        if shard_fn is not None:
-            self.model = shard_fn(self.model, sync_module_states=False)
+        if is_hf_format:
+            # Load from HuggingFace format (text_encoder subfolder)
+            if not HF_TRANSFORMERS_AVAILABLE:
+                raise ImportError(
+                    "HuggingFace transformers library is required to load HF format models. "
+                    "Install with: pip install transformers"
+                )
+            
+            logging.info(f'Loading T5 encoder from HuggingFace format: {checkpoint_path}')
+            
+            # Determine loading parameters
+            if os.path.isdir(checkpoint_path):
+                # Local directory with HF structure
+                text_encoder_dir = os.path.join(checkpoint_path, 'text_encoder')
+                if not os.path.exists(text_encoder_dir):
+                    raise ValueError(f"text_encoder subfolder not found in {checkpoint_path}")
+                load_path = text_encoder_dir
+                subfolder = None
+            else:
+                # HuggingFace model ID
+                load_path = checkpoint_path
+                subfolder = 'text_encoder'
+            
+            # Load the model
+            hf_model = HF_UMT5EncoderModel.from_pretrained(
+                load_path,
+                subfolder=subfolder,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True
+            )
+            
+            # Use HF model directly (it's already encoder-only)
+            self.model = hf_model.eval().requires_grad_(False)
+            
+            if shard_fn is not None:
+                self.model = shard_fn(self.model, sync_module_states=False)
+            else:
+                self.model.to(self.device)
+                 
+            # Tokenizer from HF format (check for tokenizer subdirectory)
+            tokenizer_dir = checkpoint_path
+            if os.path.isdir(checkpoint_path):
+                tokenizer_subdir = os.path.join(checkpoint_path, 'tokenizer')
+                if os.path.exists(tokenizer_subdir):
+                    tokenizer_dir = tokenizer_subdir
+            
+            self.tokenizer = HuggingfaceTokenizer(
+                name=tokenizer_dir, seq_len=text_len, clean='whitespace')
         else:
-            self.model.to(self.device)
-        # init tokenizer
-        self.tokenizer = HuggingfaceTokenizer(
-            name=tokenizer_path, seq_len=text_len, clean='whitespace')
+            # Load from local .pth format (original code)
+            # init model
+            model = umt5_xxl(
+                encoder_only=True,
+                return_tokenizer=False,
+                dtype=dtype,
+                device=device).eval().requires_grad_(False)
+            logging.info(f'loading {checkpoint_path}')
+            model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+            self.model = model
+            if shard_fn is not None:
+                self.model = shard_fn(self.model, sync_module_states=False)
+            else:
+                self.model.to(self.device)
+            # init tokenizer
+            self.tokenizer = HuggingfaceTokenizer(
+                name=tokenizer_path, seq_len=text_len, clean='whitespace')
 
     def __call__(self, texts, device):
         ids, mask = self.tokenizer(
@@ -509,5 +569,16 @@ class T5EncoderModel:
         ids = ids.to(device)
         mask = mask.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.model(ids, mask)
+        
+        # Call model - handles both custom T5 and HuggingFace T5
+        output = self.model(ids, mask)
+        
+        # Handle different output formats
+        if hasattr(output, 'last_hidden_state'):
+            # HuggingFace format: output is an object with last_hidden_state
+            context = output.last_hidden_state
+        else:
+            # Custom T5 format: output is the tensor directly
+            context = output
+            
         return [u[:v] for u, v in zip(context, seq_lens)]

@@ -1,11 +1,19 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
+import os
 
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+# Import for HuggingFace format support (optional, only used if HF format is detected)
+try:
+    from diffusers import AutoencoderKLWan
+    HF_DIFFUSERS_AVAILABLE = True
+except ImportError:
+    HF_DIFFUSERS_AVAILABLE = False
 
 __all__ = [
     'Wan2_1_VAE',
@@ -622,7 +630,8 @@ class Wan2_1_VAE:
                  z_dim=16,
                  vae_pth='cache/vae_step_411000.pth',
                  dtype=torch.float,
-                 device="cuda"):
+                 device="cuda",
+                 is_hf_format=False):
         self.dtype = dtype
         self.device = device
 
@@ -638,26 +647,77 @@ class Wan2_1_VAE:
         self.std = torch.tensor(std, dtype=dtype, device=device)
         self.scale = [self.mean, 1.0 / self.std]
 
-        # init model
-        self.model = _video_vae(
-            pretrained_path=vae_pth,
-            z_dim=z_dim,
-        ).eval().requires_grad_(False).to(device)
+        if is_hf_format:
+            # Load from HuggingFace format (vae subfolder)
+            if not HF_DIFFUSERS_AVAILABLE:
+                raise ImportError(
+                    "HuggingFace diffusers library is required to load HF format models. "
+                    "Install with: pip install diffusers"
+                )
+            
+            logging.info(f'Loading VAE from HuggingFace format: {vae_pth}')
+            
+            # Determine loading parameters
+            if os.path.isdir(vae_pth):
+                # Local directory with HF structure
+                vae_dir = os.path.join(vae_pth, 'vae')
+                if not os.path.exists(vae_dir):
+                    raise ValueError(f"vae subfolder not found in {vae_pth}")
+                load_path = vae_dir
+                subfolder = None
+            else:
+                # HuggingFace model ID
+                load_path = vae_pth
+                subfolder = 'vae'
+            
+            # Load the model
+            hf_vae = AutoencoderKLWan.from_pretrained(
+                load_path,
+                subfolder=subfolder,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True
+            )
+            
+            # Use HF VAE directly
+            self.model = hf_vae.eval().requires_grad_(False).to(device)
+            self._is_hf_vae = True
+        else:
+            # Load from local .pth format (original code)
+            # init model
+            self.model = _video_vae(
+                pretrained_path=vae_pth,
+                z_dim=z_dim,
+            ).eval().requires_grad_(False).to(device)
+            self._is_hf_vae = False
 
     def encode(self, videos):
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
         with amp.autocast(dtype=self.dtype):
-            return [
-                self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
-                for u in videos
-            ]
+            if self._is_hf_vae:
+                # HuggingFace VAE has different interface
+                return [
+                    self.model.encode(u.unsqueeze(0)).latent_dist.sample().float().squeeze(0)
+                    for u in videos
+                ]
+            else:
+                return [
+                    self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
+                    for u in videos
+                ]
 
     def decode(self, zs):
         with amp.autocast(dtype=self.dtype):
-            return [
-                self.model.decode(u.unsqueeze(0),
-                                  self.scale).float().clamp_(-1, 1).squeeze(0)
-                for u in zs
-            ]
+            if self._is_hf_vae:
+                # HuggingFace VAE has different interface
+                return [
+                    self.model.decode(u.unsqueeze(0)).sample.float().clamp_(-1, 1).squeeze(0)
+                    for u in zs
+                ]
+            else:
+                return [
+                    self.model.decode(u.unsqueeze(0),
+                                      self.scale).float().clamp_(-1, 1).squeeze(0)
+                    for u in zs
+                ]
