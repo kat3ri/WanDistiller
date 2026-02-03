@@ -28,6 +28,54 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
+def _is_huggingface_format(checkpoint_dir):
+    """
+    Detect if the checkpoint directory is in HuggingFace Diffusers format.
+    
+    HuggingFace format has subdirectories like:
+    - text_encoder/
+    - vae/
+    - transformer/
+    - transformer_2/
+    - tokenizer/
+    
+    Local format has files like:
+    - models_t5_umt5-xxl-enc-bf16.pth
+    - Wan2.1_VAE.pth
+    - low_noise_model/
+    - high_noise_model/
+    
+    Args:
+        checkpoint_dir (str): Path to checkpoint directory or HuggingFace model ID
+        
+    Returns:
+        bool: True if HuggingFace format, False if local format
+    """
+    # If it contains a "/" and doesn't exist locally, it might be a HF model ID
+    if '/' in checkpoint_dir and not os.path.exists(checkpoint_dir):
+        return True
+    
+    # Check if directory exists
+    if not os.path.exists(checkpoint_dir):
+        # If it doesn't exist, assume it's a HF model ID
+        return True
+    
+    # Check for HuggingFace structure markers
+    hf_markers = ['text_encoder', 'vae', 'transformer', 'transformer_2', 'tokenizer']
+    has_hf_markers = sum(1 for marker in hf_markers if os.path.exists(os.path.join(checkpoint_dir, marker))) >= 3
+    
+    # Check for local format markers
+    local_markers = ['models_t5_umt5-xxl-enc-bf16.pth', 'Wan2.1_VAE.pth', 'low_noise_model', 'high_noise_model']
+    has_local_markers = sum(1 for marker in local_markers if os.path.exists(os.path.join(checkpoint_dir, marker))) >= 2
+    
+    # If we have HF markers but not local markers, it's HF format
+    if has_hf_markers and not has_local_markers:
+        return True
+    
+    # Default to local format for backward compatibility
+    return False
+
+
 class WanT2V:
 
     def __init__(
@@ -82,24 +130,66 @@ class WanT2V:
         if t5_fsdp or dit_fsdp or use_sp:
             self.init_on_cpu = False
 
+        # Detect checkpoint format (HuggingFace vs local)
+        is_hf_format = _is_huggingface_format(checkpoint_dir)
+        if rank == 0:
+            if is_hf_format:
+                logging.info(f"Detected HuggingFace Diffusers format for: {checkpoint_dir}")
+            else:
+                logging.info(f"Detected local checkpoint format for: {checkpoint_dir}")
+
         shard_fn = partial(shard_model, device_id=device_id)
+        
+        # Load T5 text encoder based on format
+        if is_hf_format:
+            # HuggingFace format: text_encoder subfolder
+            text_encoder_path = checkpoint_dir
+            tokenizer_path = checkpoint_dir
+            logging.info(f"Loading T5 from HuggingFace format: text_encoder subfolder")
+        else:
+            # Local format: .pth file
+            text_encoder_path = os.path.join(checkpoint_dir, config.t5_checkpoint)
+            tokenizer_path = os.path.join(checkpoint_dir, config.t5_tokenizer)
+            
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
+            checkpoint_path=text_encoder_path,
+            tokenizer_path=tokenizer_path,
+            shard_fn=shard_fn if t5_fsdp else None,
+            is_hf_format=is_hf_format)
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        
+        # Load VAE based on format
+        if is_hf_format:
+            # HuggingFace format: vae subfolder
+            vae_path = checkpoint_dir
+            logging.info(f"Loading VAE from HuggingFace format: vae subfolder")
+        else:
+            # Local format: .pth file
+            vae_path = os.path.join(checkpoint_dir, config.vae_checkpoint)
+            
         self.vae = Wan2_1_VAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            vae_pth=vae_path,
+            device=self.device,
+            is_hf_format=is_hf_format)
 
+        # Load DiT models based on format
         logging.info(f"Creating WanModel from {checkpoint_dir}")
+        if is_hf_format:
+            # HuggingFace format: transformer and transformer_2 subfolders
+            low_noise_subfolder = 'transformer'
+            high_noise_subfolder = 'transformer_2'
+        else:
+            # Local format: low_noise_model and high_noise_model subfolders
+            low_noise_subfolder = config.low_noise_checkpoint
+            high_noise_subfolder = config.high_noise_checkpoint
+            
         self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
+            checkpoint_dir, subfolder=low_noise_subfolder)
         self.low_noise_model = self._configure_model(
             model=self.low_noise_model,
             use_sp=use_sp,
@@ -108,7 +198,7 @@ class WanT2V:
             convert_model_dtype=convert_model_dtype)
 
         self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
+            checkpoint_dir, subfolder=high_noise_subfolder)
         self.high_noise_model = self._configure_model(
             model=self.high_noise_model,
             use_sp=use_sp,
