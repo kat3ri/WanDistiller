@@ -1,11 +1,19 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
+import os
 
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+# Import for HuggingFace format support (optional, only used if HF format is detected)
+try:
+    from diffusers import AutoencoderKLWan
+    HF_DIFFUSERS_AVAILABLE = True
+except ImportError:
+    HF_DIFFUSERS_AVAILABLE = False
 
 __all__ = [
     'Wan2_1_VAE',
@@ -641,27 +649,37 @@ class Wan2_1_VAE:
 
         if is_hf_format:
             # Load from HuggingFace format (vae subfolder)
-            import logging
-            import os
-            from diffusers import AutoencoderKLWan
+            if not HF_DIFFUSERS_AVAILABLE:
+                raise ImportError(
+                    "HuggingFace diffusers library is required to load HF format models. "
+                    "Install with: pip install diffusers"
+                )
             
             logging.info(f'Loading VAE from HuggingFace format: {vae_pth}')
             
-            # Load the model from vae subfolder
+            # Determine path to VAE
             if os.path.isdir(vae_pth):
+                # Local directory with HF structure
                 vae_dir = os.path.join(vae_pth, 'vae')
+                if os.path.exists(vae_dir):
+                    hf_vae = AutoencoderKLWan.from_pretrained(
+                        vae_dir,
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True
+                    )
+                else:
+                    raise ValueError(f"vae subfolder not found in {vae_pth}")
             else:
-                vae_dir = vae_pth  # Assume it's a HF model ID
-                
-            hf_vae = AutoencoderKLWan.from_pretrained(
-                vae_dir if os.path.isdir(vae_dir) else vae_pth,
-                subfolder='vae' if not os.path.isdir(vae_dir) else None,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True
-            ).eval().requires_grad_(False).to(device)
+                # HuggingFace model ID
+                hf_vae = AutoencoderKLWan.from_pretrained(
+                    vae_pth,
+                    subfolder='vae',
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True
+                )
             
-            # Wrap HF VAE to match our interface
-            self.model = hf_vae
+            # Use HF VAE directly
+            self.model = hf_vae.eval().requires_grad_(False).to(device)
             self._is_hf_vae = True
         else:
             # Load from local .pth format (original code)

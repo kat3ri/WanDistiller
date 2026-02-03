@@ -51,13 +51,8 @@ def _is_huggingface_format(checkpoint_dir):
     Returns:
         bool: True if HuggingFace format, False if local format
     """
-    # If it contains a "/" and doesn't exist locally, it might be a HF model ID
-    if '/' in checkpoint_dir and not os.path.exists(checkpoint_dir):
-        return True
-    
-    # Check if directory exists
+    # If path doesn't exist locally, assume it's a HF model ID
     if not os.path.exists(checkpoint_dir):
-        # If it doesn't exist, assume it's a HF model ID
         return True
     
     # Check for HuggingFace structure markers

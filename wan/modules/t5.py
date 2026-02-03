@@ -2,12 +2,20 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .tokenizers import HuggingfaceTokenizer
+
+# Import for HuggingFace format support (optional, only used if HF format is detected)
+try:
+    from transformers import UMT5EncoderModel as HF_UMT5EncoderModel
+    HF_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    HF_TRANSFORMERS_AVAILABLE = False
 
 __all__ = [
     'T5Model',
@@ -490,8 +498,11 @@ class T5EncoderModel:
 
         if is_hf_format:
             # Load from HuggingFace format (text_encoder subfolder)
-            from transformers import UMT5EncoderModel as HF_UMT5EncoderModel
-            import os
+            if not HF_TRANSFORMERS_AVAILABLE:
+                raise ImportError(
+                    "HuggingFace transformers library is required to load HF format models. "
+                    "Install with: pip install transformers"
+                )
             
             logging.info(f'Loading T5 encoder from HuggingFace format: {checkpoint_path}')
             
