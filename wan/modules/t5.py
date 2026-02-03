@@ -486,6 +486,7 @@ class T5EncoderModel:
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
+        self.is_hf_format = is_hf_format
 
         if is_hf_format:
             # Load from HuggingFace format (text_encoder subfolder)
@@ -494,22 +495,29 @@ class T5EncoderModel:
             
             logging.info(f'Loading T5 encoder from HuggingFace format: {checkpoint_path}')
             
-            # Load the model from text_encoder subfolder
+            # Determine path to text_encoder
             if os.path.isdir(checkpoint_path):
+                # Local directory with HF structure
                 text_encoder_dir = os.path.join(checkpoint_path, 'text_encoder')
+                if os.path.exists(text_encoder_dir):
+                    hf_model = HF_UMT5EncoderModel.from_pretrained(
+                        text_encoder_dir,
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True
+                    )
+                else:
+                    raise ValueError(f"text_encoder subfolder not found in {checkpoint_path}")
             else:
-                text_encoder_dir = checkpoint_path  # Assume it's a HF model ID
-                
-            hf_model = HF_UMT5EncoderModel.from_pretrained(
-                text_encoder_dir,
-                subfolder='text_encoder' if not os.path.isdir(text_encoder_dir) else None,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True
-            ).eval().requires_grad_(False)
+                # HuggingFace model ID
+                hf_model = HF_UMT5EncoderModel.from_pretrained(
+                    checkpoint_path,
+                    subfolder='text_encoder',
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True
+                )
             
-            # Convert HF model to our custom model format
-            # The HF model is compatible, so we can use it directly
-            self.model = hf_model.encoder  # Extract just the encoder
+            # Use HF model directly (it's already encoder-only)
+            self.model = hf_model.eval().requires_grad_(False)
             
             if shard_fn is not None:
                 self.model = shard_fn(self.model, sync_module_states=False)
@@ -519,6 +527,9 @@ class T5EncoderModel:
             # Tokenizer from HF format
             if os.path.isdir(checkpoint_path):
                 tokenizer_dir = os.path.join(checkpoint_path, 'tokenizer')
+                if not os.path.exists(tokenizer_dir):
+                    # Fallback to root directory
+                    tokenizer_dir = checkpoint_path
             else:
                 tokenizer_dir = checkpoint_path
             self.tokenizer = HuggingfaceTokenizer(
@@ -548,5 +559,16 @@ class T5EncoderModel:
         ids = ids.to(device)
         mask = mask.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.model(ids, mask)
+        
+        # Call model - handles both custom T5 and HuggingFace T5
+        output = self.model(ids, mask)
+        
+        # Handle different output formats
+        if hasattr(output, 'last_hidden_state'):
+            # HuggingFace format: output is an object with last_hidden_state
+            context = output.last_hidden_state
+        else:
+            # Custom T5 format: output is the tensor directly
+            context = output
+            
         return [u[:v] for u, v in zip(context, seq_lens)]
