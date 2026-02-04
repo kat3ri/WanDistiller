@@ -598,6 +598,9 @@ def generate_and_save_samples(
             # Start with pure noise
             current_latents = latents
             
+            # Small epsilon for numerical stability
+            epsilon = 1e-8
+            
             # Iterative denoising loop
             for i, t in enumerate(timesteps):
                 # Prepare timestep tensor for batch
@@ -613,22 +616,28 @@ def generate_and_save_samples(
                 
                 # DDIM update step
                 # Calculate alpha values for DDIM sampling
-                alpha_t = 1.0 - (t / 1000.0)  # Linear schedule
-                alpha_t_prev = 1.0 - (timesteps[i+1] / 1000.0) if i < len(timesteps) - 1 else 1.0
+                # Alpha represents the signal scale - should be low at high t (noisy) and high at low t (clean)
+                alpha_t = t.float() / 1000.0  # Converts t=999 -> 0.999, t=0 -> 0.0
+                alpha_t_prev = timesteps[i+1].float() / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device)
                 
-                # Add small epsilon for numerical stability
-                epsilon = 1e-8
-                alpha_t = max(alpha_t, epsilon)
-                alpha_t_prev = max(alpha_t_prev, epsilon)
+                # Clamp alpha values for numerical stability (maintain tensor type)
+                alpha_t = torch.clamp(alpha_t, min=epsilon, max=1.0 - epsilon)
+                alpha_t_prev = torch.clamp(alpha_t_prev, min=epsilon, max=1.0 - epsilon)
+                
+                # Precompute square roots for efficiency
+                sqrt_alpha_t = torch.sqrt(alpha_t)
+                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+                sqrt_alpha_t_prev = torch.sqrt(alpha_t_prev)
+                sqrt_one_minus_alpha_t_prev = torch.sqrt(1 - alpha_t_prev)
                 
                 # Compute predicted original sample (x_0)
-                pred_original_sample = (current_latents - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+                pred_original_sample = (current_latents - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
                 
                 # Compute direction pointing to x_t
-                pred_sample_direction = torch.sqrt(1 - alpha_t_prev) * noise_pred
+                pred_sample_direction = sqrt_one_minus_alpha_t_prev * noise_pred
                 
                 # Compute x_{t-1}
-                current_latents = torch.sqrt(alpha_t_prev) * pred_original_sample + pred_sample_direction
+                current_latents = sqrt_alpha_t_prev * pred_original_sample + pred_sample_direction
             
             denoised_latents = current_latents
             
