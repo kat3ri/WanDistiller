@@ -523,8 +523,28 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         # - Creating proper directory structure
         super().save_pretrained(output_dir, **kwargs)
         
+        # Add ComfyUI-required metadata to config.json
+        # ComfyUI needs _class_name to properly instantiate the model class
+        config_path = os.path.join(output_dir, "config.json")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Add _class_name field (required by ComfyUI for model instantiation)
+        config["_class_name"] = "WanLiteStudent"
+        
+        # Add _diffusers_version for compatibility tracking
+        try:
+            import diffusers
+            config["_diffusers_version"] = diffusers.__version__
+        except (ImportError, AttributeError):
+            config["_diffusers_version"] = "0.31.0"  # fallback version
+        
+        # Write updated config back
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        
         print(f"✓ Model saved successfully to: {output_dir}")
-        print(f"  - config.json (model configuration)")
+        print(f"  - config.json (model configuration with ComfyUI metadata)")
         print(f"  - diffusion_model.safetensors (model weights)")
         print(f"  Format: HuggingFace Diffusers (compatible with WAN and ComfyUI)")
 
