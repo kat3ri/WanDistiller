@@ -565,8 +565,9 @@ def generate_and_save_samples(
     
     # Distribute prompts across processes for parallel generation
     # Each process handles a subset of prompts
+    import math
     num_prompts = len(sample_prompts)
-    prompts_per_rank = (num_prompts + world_size - 1) // world_size  # Ceiling division
+    prompts_per_rank = math.ceil(num_prompts / world_size)
     start_idx = rank * prompts_per_rank
     end_idx = min(start_idx + prompts_per_rank, num_prompts)
     
@@ -715,7 +716,9 @@ def generate_and_save_samples(
                 filepath = os.path.join(sample_dir, filename)
                 save_image(image.cpu(), filepath)
                 
-                if rank == 0 or len(my_prompts) <= 4:  # Reduce logging for large batches
+                # Log sample generation (reduce verbosity for large batches)
+                VERBOSE_LOGGING_THRESHOLD = 4
+                if rank == 0 or len(my_prompts) <= VERBOSE_LOGGING_THRESHOLD:
                     print(f"  [Rank {rank}] Saved sample {i+1}/{batch_size}: {filepath}")
         
         if rank == 0:
