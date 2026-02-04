@@ -341,7 +341,6 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         projection_factor=1.0,
         # Non-config parameters (for initialization only, not saved to config)
         teacher_checkpoint_path=None,
-        device=None,
         distributed=False,
         use_gradient_checkpointing=False
     ):
@@ -385,14 +384,6 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         self.distributed = distributed
         self.use_gradient_checkpointing = use_gradient_checkpointing
         
-        # Default to cuda if available, otherwise cpu
-        if device is None:
-            if distributed:
-                # In a distributed setting, device should NOT be None.
-                # It should be explicitly passed as cuda:local_rank.
-                raise ValueError("Device must be specified for distributed training.")
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         # 1. Text Projection Layer
         # Maps text encoder output (e.g., 4096) down to hidden size (e.g., 1024)
         # Defined here to be populated by load_and_project_weights
@@ -414,9 +405,6 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         self.blocks = nn.ModuleList([
             WanTransformerBlock(hidden_size, num_heads) for _ in range(depth)
         ])
-
-        # Move to device first
-        self.to(device)
 
         # 5. Apply Projection Mapper
         # Loads weights from the teacher checkpoint and maps them to the student architecture
@@ -962,10 +950,11 @@ def main():
         text_encoder_output_dim=student_config["text_encoder_output_dim"],
         projection_factor=student_config.get("projection_factor", 1.0),
         teacher_checkpoint_path=args.teacher_path, 
-        device=device,
         distributed=args.distributed,
         use_gradient_checkpointing=args.gradient_checkpointing
     )
+    
+    student_model.to(device)
     
     if is_main_process(rank):
         print("✓ Student model initialized.")
