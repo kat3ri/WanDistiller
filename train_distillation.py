@@ -589,26 +589,66 @@ def generate_and_save_samples(
                 device=device
             )
             
-            # Simple denoising: start from high noise and denoise with a single step
-            # This is a simplified sampling - proper DDPM/DDIM sampling would be better
-            # but requires implementing a full sampling loop
-            # NOTE: Samples generated this way will be noisy and are intended only for
-            # rough progress monitoring, not final quality assessment
-            timestep = torch.ones(batch_size, device=device).long() * 500
+            # Multi-step DDIM sampling for better quality images
+            # Use a simplified DDIM sampling schedule with 10 steps
+            num_inference_steps = 10
+            # Create timestep schedule from high (999) to low (0)
+            timesteps = torch.linspace(999, 0, num_inference_steps, dtype=torch.long, device=device)
             
-            # Get student prediction
-            student_output = student_model(
-                latent_0=latents,
-                latent_1=None,
-                timestep=timestep,
-                encoder_hidden_states=text_embeddings,
-            )
+            # Start with pure noise
+            current_latents = latents
             
-            # Apply student's prediction to get denoised latents
-            # Using a simple mixing factor (alpha=0.5) to balance between original noise
-            # and predicted noise. This is a heuristic for quick sample generation.
-            DENOISING_ALPHA = 0.5
-            denoised_latents = latents - DENOISING_ALPHA * student_output
+            # Epsilon for numerical stability - use larger value to avoid extreme divisions
+            epsilon = 1e-3
+            
+            # Iterative denoising loop
+            for i, t in enumerate(timesteps):
+                # Prepare timestep tensor for batch
+                timestep_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
+                
+                # Get model prediction for noise at timestep t
+                noise_pred = student_model(
+                    latent_0=current_latents,
+                    latent_1=None,
+                    timestep=timestep_batch,
+                    encoder_hidden_states=text_embeddings,
+                )
+                
+                # DDIM update step
+                # Calculate alpha values for DDIM sampling
+                # In DDPM/DDIM: x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * noise
+                # alpha should be HIGH at low t (clean) and LOW at high t (noisy)
+                # So at t=999 (noisy): alpha≈0, at t=0 (clean): alpha≈1
+                alpha_t = 1.0 - (t.float() / 1000.0)  # t=999 -> alpha=0.001, t=0 -> alpha=1.0
+                
+                # Clamp alpha_t for numerical stability (maintain tensor type)
+                alpha_t = torch.clamp(alpha_t, min=epsilon, max=1.0 - epsilon)
+                
+                # For the previous timestep, use 1.0 for the final step to get clean output
+                if i < len(timesteps) - 1:
+                    alpha_t_prev = 1.0 - (timesteps[i+1].float() / 1000.0)
+                    # Clamp alpha_t_prev for intermediate steps
+                    alpha_t_prev = torch.clamp(alpha_t_prev, min=epsilon, max=1.0 - epsilon)
+                else:
+                    # Final step: alpha_t_prev should be 1.0 for fully denoised output (no clamping)
+                    alpha_t_prev = torch.tensor(1.0, device=device)
+                
+                # Precompute square roots for efficiency
+                sqrt_alpha_t = torch.sqrt(alpha_t)
+                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+                sqrt_alpha_t_prev = torch.sqrt(alpha_t_prev)
+                sqrt_one_minus_alpha_t_prev = torch.sqrt(1 - alpha_t_prev)
+                
+                # Compute predicted original sample (x_0)
+                pred_original_sample = (current_latents - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                
+                # Compute direction pointing to x_t
+                pred_sample_direction = sqrt_one_minus_alpha_t_prev * noise_pred
+                
+                # Compute x_{t-1}
+                current_latents = sqrt_alpha_t_prev * pred_original_sample + pred_sample_direction
+            
+            denoised_latents = current_latents
             
             # Convert to format expected by VAE (add temporal dimension for teacher VAE)
             # VAE expects [C, F, H, W] format in a list
@@ -1376,34 +1416,40 @@ def main():
                 sys.exit(1)
         
         # End of epoch - generate sample images if enabled
-        if args.save_samples and is_main_process(rank):
+        if args.save_samples:
             # Check if we should generate samples this epoch
             if (epoch + 1) % args.sample_interval == 0:
-                print(f"\n[Epoch {epoch+1}] Generating sample images...")
-                
-                # Only generate samples if we have the necessary components
-                if teacher_text_encoder is not None and teacher_vae is not None and teacher_wan is not None:
-                    # Unwrap model if using DataParallel or DistributedDataParallel
-                    model_for_sampling = student_model.module if hasattr(student_model, 'module') else student_model
+                if is_main_process(rank):
+                    print(f"\n[Epoch {epoch+1}] Generating sample images...")
                     
-                    generate_and_save_samples(
-                        student_model=model_for_sampling,
-                        teacher_text_encoder=teacher_text_encoder,
-                        teacher_vae=teacher_vae,
-                        teacher_wan=teacher_wan,
-                        sample_prompts=args.sample_prompts,
-                        sample_dir=sample_dir,
-                        epoch=epoch + 1,
-                        device=device,
-                        teacher_device=teacher_device,
-                        teacher_dtype=teacher_dtype,
-                        student_config=student_config,
-                        proj_layer=proj_layer
-                    )
-                else:
-                    print(f"  Warning: Cannot generate samples - missing teacher components")
+                    # Only generate samples if we have the necessary components
+                    if teacher_text_encoder is not None and teacher_vae is not None and teacher_wan is not None:
+                        # Unwrap model if using DataParallel or DistributedDataParallel
+                        model_for_sampling = student_model.module if hasattr(student_model, 'module') else student_model
+                        
+                        generate_and_save_samples(
+                            student_model=model_for_sampling,
+                            teacher_text_encoder=teacher_text_encoder,
+                            teacher_vae=teacher_vae,
+                            teacher_wan=teacher_wan,
+                            sample_prompts=args.sample_prompts,
+                            sample_dir=sample_dir,
+                            epoch=epoch + 1,
+                            device=device,
+                            teacher_device=teacher_device,
+                            teacher_dtype=teacher_dtype,
+                            student_config=student_config,
+                            proj_layer=proj_layer
+                        )
+                    else:
+                        print(f"  Warning: Cannot generate samples - missing teacher components")
+                    
+                    print()  # Add blank line for readability
                 
-                print()  # Add blank line for readability
+                # Synchronize all processes after sample generation in distributed mode
+                # This prevents other processes from continuing while main process generates samples
+                if args.distributed:
+                    dist.barrier()
 
         if training_complete:
             if is_main_process(rank):
