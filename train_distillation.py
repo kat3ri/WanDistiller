@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -160,12 +161,15 @@ def setup_distributed():
     
     # Initialize the distributed process group
     # The NCCL backend will use the device set by torch.cuda.set_device()
+    # Set a longer timeout (1 hour) to allow for sample generation during training
+    # which can take longer than the default 10 minutes
     try:
         dist.init_process_group(
             backend='nccl', 
             init_method='env://', 
             world_size=world_size, 
-            rank=rank
+            rank=rank,
+            timeout=datetime.timedelta(seconds=3600)  # 1 hour timeout
         )
         dist.barrier()
     except Exception as e:
