@@ -392,7 +392,6 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
                 # It should be explicitly passed as cuda:local_rank.
                 raise ValueError("Device must be specified for distributed training.")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
 
         # 1. Text Projection Layer
         # Maps text encoder output (e.g., 4096) down to hidden size (e.g., 1024)

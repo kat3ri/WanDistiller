@@ -477,3 +477,10 @@ Contributions welcome! Please:
 ---
 
 **Status**: ✅ Production test passing | 🎯 Ready for training | 📦 55 mock prompts included
+
+
+TO DO:
+Fix sample generation
+Enable true weight projection from teacher model 
+Explore full denoising from teacher to student (slower but mrore accurate)
+✅ MultiGPU support

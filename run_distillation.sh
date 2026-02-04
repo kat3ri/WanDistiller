@@ -63,9 +63,9 @@ torchrun --nproc_per_node=$NPROC_PER_NODE train_distillation.py \
     --num_epochs 20 \
     --batch_size 1 \
     --lr 1e-5 \
-    --gradient_checkpointing \
-    --save_samples \
-    --sample_prompts "A mountain landscape" "A city at night" "a woman standing in a field of sunflowers" \
-    --sample_interval 1
+    --gradient_checkpointing 
+#    --save_samples \
+#    --sample_prompts "A mountain landscape" "A city at night" "a woman standing in a field of sunflowers" \
+#    --sample_interval 10
 
 echo "Training finished."
