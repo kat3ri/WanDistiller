@@ -10,6 +10,9 @@ import json
 import tempfile
 import sys
 
+# Default version constant (same as in train_distillation.py)
+DEFAULT_DIFFUSERS_VERSION = "0.31.0"
+
 def test_save_pretrained_adds_metadata():
     """Test the save_pretrained method adds ComfyUI metadata."""
     print("=" * 80)
@@ -48,7 +51,7 @@ def test_save_pretrained_adds_metadata():
             import diffusers
             config["_diffusers_version"] = diffusers.__version__
         except (ImportError, AttributeError):
-            config["_diffusers_version"] = "0.31.0"  # fallback version
+            config["_diffusers_version"] = DEFAULT_DIFFUSERS_VERSION
         
         # Write updated config back
         with open(config_path, 'w') as f:

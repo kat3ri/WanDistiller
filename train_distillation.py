@@ -22,6 +22,9 @@ from projection_mapper import load_and_project_weights
 from wan.text2video import WanT2V
 from wan.configs.wan_t2v_A14B import t2v_A14B
 
+# Default version for diffusers compatibility tracking
+DEFAULT_DIFFUSERS_VERSION = "0.31.0"
+
 
 # -----------------------------------------------------------------------------
 # Validation and Error Detection
@@ -526,22 +529,32 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         # Add ComfyUI-required metadata to config.json
         # ComfyUI needs _class_name to properly instantiate the model class
         config_path = os.path.join(output_dir, "config.json")
-        with open(config_path, 'r') as f:
-            config = json.load(f)
         
-        # Add _class_name field (required by ComfyUI for model instantiation)
-        config["_class_name"] = "WanLiteStudent"
-        
-        # Add _diffusers_version for compatibility tracking
         try:
-            import diffusers
-            config["_diffusers_version"] = diffusers.__version__
-        except (ImportError, AttributeError):
-            config["_diffusers_version"] = "0.31.0"  # fallback version
-        
-        # Write updated config back
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
+            # Read the config saved by parent class
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Add _class_name field (required by ComfyUI for model instantiation)
+            config["_class_name"] = "WanLiteStudent"
+            
+            # Add _diffusers_version for compatibility tracking
+            try:
+                import diffusers
+                config["_diffusers_version"] = diffusers.__version__
+            except (ImportError, AttributeError):
+                config["_diffusers_version"] = DEFAULT_DIFFUSERS_VERSION
+            
+            # Write updated config back
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+                
+        except FileNotFoundError:
+            print(f"Warning: config.json not found at {config_path}. ComfyUI metadata not added.")
+        except json.JSONDecodeError as e:
+            print(f"Warning: Failed to parse config.json: {e}. ComfyUI metadata not added.")
+        except Exception as e:
+            print(f"Warning: Failed to add ComfyUI metadata to config.json: {e}")
         
         print(f"✓ Model saved successfully to: {output_dir}")
         print(f"  - config.json (model configuration with ComfyUI metadata)")
