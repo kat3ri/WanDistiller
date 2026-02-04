@@ -328,9 +328,8 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
-        # First parameter can be either model_type (str) or config (dict) for backward compat
-        model_type="WanLiteStudent",
         # Config parameters (will be saved to config.json via @register_to_config)
+        model_type="WanLiteStudent",
         hidden_size=1024,
         depth=16,
         num_heads=16,
@@ -349,12 +348,8 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         """
         Initialize WanLiteStudent with parameters compatible with WAN model structure.
         
-        Supports both calling conventions:
-        - New: WanLiteStudent(model_type="WanLiteStudent", hidden_size=1024, ...)
-        - Old: WanLiteStudent(config_dict, teacher_checkpoint_path=...) [backward compat]
-        
         Args:
-            model_type: Model identifier or config dict (for backward compat)
+            model_type: Model identifier (or dict for backward compat - not recommended)
             hidden_size: Hidden dimension for the model
             depth: Number of transformer blocks
             num_heads: Number of attention heads
@@ -370,6 +365,7 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
             use_gradient_checkpointing: Enable gradient checkpointing for memory savings (not saved)
         """
         # Handle backward compatibility: if model_type is a dict, extract params
+        # Note: This is for backward compatibility only. New code should pass individual params.
         if isinstance(model_type, dict):
             config = model_type
             model_type = config.get("model_type", "WanLiteStudent")
@@ -384,19 +380,6 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
             projection_factor = config.get("projection_factor", 1.0)
         
         super().__init__()
-        
-        # Store non-config parameters as instance attributes (not in config)
-        self.distributed = distributed
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-        
-        # Default to cuda if available, otherwise cpu
-        if device is None:
-            if distributed:
-                # In a distributed setting, device should NOT be None.
-                # It should be explicitly passed as cuda:local_rank.
-                raise ValueError("Device must be specified for distributed training.")
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
         
         # Store non-config parameters as instance attributes (not in config)
         self.distributed = distributed

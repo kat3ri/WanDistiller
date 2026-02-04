@@ -95,8 +95,10 @@ def test_save_load_cycle():
         
         # Verify values match
         for key in required_keys:
-            if saved_config[key] != config.get(key, saved_config[key]):
-                print(f"✗ Config mismatch for {key}: saved={saved_config[key]}, expected={config[key]}")
+            expected_value = config[key]
+            actual_value = saved_config[key]
+            if actual_value != expected_value:
+                print(f"✗ Config mismatch for {key}: saved={actual_value}, expected={expected_value}")
                 return False
         print(f"   ✓ All config values match original")
         
@@ -109,8 +111,10 @@ def test_save_load_cycle():
             
             # Verify configs match
             for key in required_keys:
-                if getattr(loaded_model.config, key) != config.get(key, getattr(loaded_model.config, key)):
-                    print(f"✗ Loaded config mismatch for {key}")
+                expected_value = config[key]
+                loaded_value = getattr(loaded_model.config, key)
+                if loaded_value != expected_value:
+                    print(f"✗ Loaded config mismatch for {key}: loaded={loaded_value}, expected={expected_value}")
                     return False
             print("   ✓ Loaded config matches original")
             
