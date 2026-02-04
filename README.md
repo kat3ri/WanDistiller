@@ -124,11 +124,13 @@ python train_distillation.py \
 
 **Sample Generation Options:**
 - `--save_samples`: Enable sample image generation during training
-- `--sample_prompts`: Text prompts to use for generation (default: 2 example prompts)
+- `--sample_prompts`: Text prompts to use for generation (default: first 2 prompts from training data). **Tip:** Choose prompts representative of your training data domain for best monitoring.
 - `--sample_interval`: Generate samples every N epochs (default: 1, i.e., once per epoch)
 - `--sample_dir`: Directory to save samples (default: `{output_dir}/samples`)
 
 Samples are saved as `epoch_NNNN_sample_MM.png` in the sample directory, where NNNN is the epoch number and MM is the sample index.
+
+**Note:** Sample images use a simplified single-step denoising process and may appear noisy. They are intended for rough progress monitoring, not final quality assessment.
 
 ## 📁 Project Structure
 

@@ -592,6 +592,8 @@ def generate_and_save_samples(
             # Simple denoising: start from high noise and denoise with a single step
             # This is a simplified sampling - proper DDPM/DDIM sampling would be better
             # but requires implementing a full sampling loop
+            # NOTE: Samples generated this way will be noisy and are intended only for
+            # rough progress monitoring, not final quality assessment
             timestep = torch.ones(batch_size, device=device).long() * 500
             
             # Get student prediction
@@ -603,14 +605,18 @@ def generate_and_save_samples(
             )
             
             # Apply student's prediction to get denoised latents
-            # Using a simple update step
-            alpha = 0.5  # Simple mixing factor
-            denoised_latents = latents - alpha * student_output
+            # Using a simple mixing factor (alpha=0.5) to balance between original noise
+            # and predicted noise. This is a heuristic for quick sample generation.
+            DENOISING_ALPHA = 0.5
+            denoised_latents = latents - DENOISING_ALPHA * student_output
             
             # Convert to format expected by VAE (add temporal dimension for teacher VAE)
             # VAE expects [C, F, H, W] format in a list
             if denoised_latents.dim() == 4:
+                # Standard case: [B, C, H, W] -> list of [C, 1, H, W]
                 vae_latents_list = [denoised_latents[i].unsqueeze(1) for i in range(denoised_latents.shape[0])]
+            else:
+                raise ValueError(f"Unexpected latent dimensions: {denoised_latents.shape}. Expected 4D tensor [B, C, H, W]")
             
             # Apply projection if needed
             if proj_layer is not None:
@@ -701,9 +707,9 @@ def main():
     parser.add_argument("--sample_dir", type=str, default=None,
                         help="Directory to save sample images (default: {output_dir}/samples)")
     parser.add_argument("--sample_prompts", type=str, nargs="+", 
-                        default=["A serene mountain landscape at sunset", 
-                                 "A futuristic city with neon lights"],
-                        help="Prompts to use for sample generation")
+                        default=None,
+                        help="Prompts to use for sample generation (default: first 2 prompts from training data). "
+                             "It's recommended to choose prompts representative of your training data domain.")
     parser.add_argument("--sample_interval", type=int, default=1,
                         help="Generate samples every N epochs (default: 1, i.e., once per epoch)")
 
@@ -976,6 +982,18 @@ def main():
             sample_dir = os.path.join(args.output_dir, "samples")
         else:
             sample_dir = args.sample_dir
+        
+        # Set default sample prompts if not provided (use first 2 from dataset)
+        if args.sample_prompts is None:
+            if len(dataset) >= 2:
+                args.sample_prompts = [dataset[0], dataset[1]]
+            elif len(dataset) == 1:
+                args.sample_prompts = [dataset[0]]
+            else:
+                # Fallback to generic prompts if dataset is empty
+                args.sample_prompts = ["A test image", "Another test image"]
+                if is_main_process(rank):
+                    print("Warning: Using generic default prompts. Consider specifying --sample_prompts.")
         
         # Only create directory on main process
         if is_main_process(rank):

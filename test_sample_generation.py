@@ -65,11 +65,7 @@ def create_mock_student():
             # Simple pass through
             return self.conv(latent_0)
         
-        def train(self):
-            pass
-        
-        def eval(self):
-            pass
+        # train() and eval() are inherited from nn.Module and work correctly
     
     return MockStudent()
 
