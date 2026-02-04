@@ -598,8 +598,8 @@ def generate_and_save_samples(
             # Start with pure noise
             current_latents = latents
             
-            # Small epsilon for numerical stability
-            epsilon = 1e-8
+            # Epsilon for numerical stability - use larger value to avoid extreme divisions
+            epsilon = 1e-3
             
             # Iterative denoising loop
             for i, t in enumerate(timesteps):
@@ -616,9 +616,17 @@ def generate_and_save_samples(
                 
                 # DDIM update step
                 # Calculate alpha values for DDIM sampling
-                # Alpha represents the signal scale - should be low at high t (noisy) and high at low t (clean)
-                alpha_t = t.float() / 1000.0  # Converts t=999 -> 0.999, t=0 -> 0.0
-                alpha_t_prev = timesteps[i+1].float() / 1000.0 if i < len(timesteps) - 1 else torch.tensor(0.0, device=device)
+                # In DDPM/DDIM: x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * noise
+                # alpha should be HIGH at low t (clean) and LOW at high t (noisy)
+                # So at t=999 (noisy): alpha≈0, at t=0 (clean): alpha≈1
+                alpha_t = 1.0 - (t.float() / 1000.0)  # t=999 -> alpha=0.001, t=0 -> alpha=1.0
+                
+                # For the previous timestep, use 1.0 for the final step to get clean output
+                if i < len(timesteps) - 1:
+                    alpha_t_prev = 1.0 - (timesteps[i+1].float() / 1000.0)
+                else:
+                    # Final step: alpha_t_prev should be 1.0 for fully denoised output
+                    alpha_t_prev = torch.tensor(1.0, device=device)
                 
                 # Clamp alpha values for numerical stability (maintain tensor type)
                 alpha_t = torch.clamp(alpha_t, min=epsilon, max=1.0 - epsilon)
