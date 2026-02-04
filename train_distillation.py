@@ -547,8 +547,7 @@ def generate_and_save_samples(
         proj_layer: Optional projection layer for channel conversion
     """
     import os
-    from PIL import Image
-    import numpy as np
+    from torchvision.utils import save_image
     
     # Create sample directory if it doesn't exist
     os.makedirs(sample_dir, exist_ok=True)
@@ -628,20 +627,15 @@ def generate_and_save_samples(
             # Save each generated image
             for i, video in enumerate(decoded_videos):
                 # video shape is [C, F, H, W], take first frame
-                # Convert from [-1, 1] range to [0, 255]
+                # Convert from [-1, 1] range to [0, 1]
                 image = video[:, 0, :, :]  # Take first frame: [C, H, W]
                 image = (image + 1.0) / 2.0  # [-1, 1] -> [0, 1]
                 image = image.clamp(0, 1)
                 
-                # Convert to numpy and PIL
-                image = image.cpu().permute(1, 2, 0).numpy()  # [H, W, C]
-                image = (image * 255).astype(np.uint8)
-                
-                # Save image
-                pil_image = Image.fromarray(image)
+                # Save image using torchvision
                 filename = f"epoch_{epoch:04d}_sample_{i:02d}.png"
                 filepath = os.path.join(sample_dir, filename)
-                pil_image.save(filepath)
+                save_image(image.cpu(), filepath)
                 
                 print(f"  Saved sample {i+1}/{batch_size}: {filepath}")
         
