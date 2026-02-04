@@ -13,6 +13,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from safetensors.torch import save_file
 from easydict import EasyDict
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
 
 from projection_mapper import load_and_project_weights
 
@@ -304,9 +306,9 @@ class WanTransformerBlock(nn.Module):
         return x
 
 
-class WanLiteStudent(nn.Module):
+class WanLiteStudent(ModelMixin, ConfigMixin):
     """
-    WanLiteStudent model definition - A 2D image-only model.
+    WanLiteStudent model definition - A 2D image-only model compatible with HuggingFace Diffusers.
 
     This model is designed for static image generation (Text-to-Image),
     not video generation. It receives projected weights from the teacher
@@ -314,13 +316,75 @@ class WanLiteStudent(nn.Module):
 
     The projection_mapper handles converting the teacher's 3D video weights
     to the student's 2D image architecture.
+    
+    Inherits from ModelMixin and ConfigMixin to provide HuggingFace Diffusers compatibility,
+    allowing the model to be saved and loaded with the same structure as WAN models.
     """
+    
+    # Specify which config keys should be saved
+    _supports_gradient_checkpointing = True
+    config_name = "config.json"
 
-    def __init__(self, config, teacher_checkpoint_path=None, device=None, distributed=False, use_gradient_checkpointing=False):
+    @register_to_config
+    def __init__(
+        self,
+        # Config parameters (will be saved to config.json via @register_to_config)
+        model_type="WanLiteStudent",
+        hidden_size=1024,
+        depth=16,
+        num_heads=16,
+        num_channels=4,
+        image_size=1024,
+        patch_size=16,
+        text_max_length=77,
+        text_encoder_output_dim=4096,
+        projection_factor=1.0,
+        # Non-config parameters (for initialization only, not saved to config)
+        teacher_checkpoint_path=None,
+        device=None,
+        distributed=False,
+        use_gradient_checkpointing=False
+    ):
+        """
+        Initialize WanLiteStudent with parameters compatible with WAN model structure.
+        
+        Args:
+            model_type: Model identifier (or dict for backward compat - not recommended)
+            hidden_size: Hidden dimension for the model
+            depth: Number of transformer blocks
+            num_heads: Number of attention heads
+            num_channels: Number of input/output channels (typically 4 for latent space)
+            image_size: Input image size
+            patch_size: Patch size for image tokenization
+            text_max_length: Maximum text sequence length
+            text_encoder_output_dim: Output dimension of text encoder (e.g., 4096 for UMT5)
+            projection_factor: Factor for weight projection from teacher
+            teacher_checkpoint_path: Path to teacher checkpoint for weight initialization (not saved)
+            device: Target device for model (not saved)
+            distributed: Whether running in distributed mode (not saved)
+            use_gradient_checkpointing: Enable gradient checkpointing for memory savings (not saved)
+        """
+        # Handle backward compatibility: if model_type is a dict, extract params
+        # Note: This is for backward compatibility only. New code should pass individual params.
+        if isinstance(model_type, dict):
+            config = model_type
+            model_type = config.get("model_type", "WanLiteStudent")
+            hidden_size = config["hidden_size"]
+            depth = config["depth"]
+            num_heads = config["num_heads"]
+            num_channels = config["num_channels"]
+            image_size = config["image_size"]
+            patch_size = config["patch_size"]
+            text_max_length = config["text_max_length"]
+            text_encoder_output_dim = config["text_encoder_output_dim"]
+            projection_factor = config.get("projection_factor", 1.0)
+        
         super().__init__()
-        self.config = config
+        
+        # Store non-config parameters as instance attributes (not in config)
         self.distributed = distributed
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        
         # Default to cuda if available, otherwise cpu
         if device is None:
             if distributed:
@@ -330,15 +394,8 @@ class WanLiteStudent(nn.Module):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
-        # Extract configuration parameters
-        hidden_size = config["hidden_size"]
-        depth = config["depth"]
-        num_heads = config["num_heads"]
-        num_channels = config["num_channels"]
-        text_encoder_output_dim = config["text_encoder_output_dim"]
-
         # 1. Text Projection Layer
-        # Maps text encoder output (e.g., 4096) down to hidden size (e.g., 640)
+        # Maps text encoder output (e.g., 4096) down to hidden size (e.g., 1024)
         # Defined here to be populated by load_and_project_weights
         self.text_proj = nn.Linear(text_encoder_output_dim, hidden_size)
 
@@ -443,37 +500,35 @@ class WanLiteStudent(nn.Module):
         student_output = self.conv_out(x)
         return student_output
 
-    def save_pretrained(self, output_dir):
+    def save_pretrained(self, output_dir, **kwargs):
         """
-        Saves the model as a Diffusers-compatible structure.
-        Saves:
-        1. student_config.json (The configuration)
-        2. diffusion_model.safetensors (The weights)
+        Saves the model using HuggingFace Diffusers format, compatible with WAN model structure.
+        
+        This method uses the built-in ModelMixin.save_pretrained() which automatically saves:
+        1. config.json - Model configuration (from @register_to_config parameters)
+        2. diffusion_model.safetensors - Model weights in safetensors format
+        
+        The saved model will be compatible with WanModel.from_pretrained() and ComfyUI.
+        
+        Args:
+            output_dir: Directory to save the model
+            **kwargs: Additional arguments passed to ModelMixin.save_pretrained()
         """
-
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Use the parent class's save_pretrained method from ModelMixin
+        # This automatically handles:
+        # - Saving config.json with all @register_to_config parameters
+        # - Saving model weights as diffusion_model.safetensors
+        # - Creating proper directory structure
+        super().save_pretrained(output_dir, **kwargs)
+        
+        print(f"✓ Model saved successfully to: {output_dir}")
+        print(f"  - config.json (model configuration)")
+        print(f"  - diffusion_model.safetensors (model weights)")
+        print(f"  Format: HuggingFace Diffusers (compatible with WAN and ComfyUI)")
 
-        # 1. Save Configuration as JSON
-        # Diffusers requires the config to be a JSON file
-        config = self.config
-        config_path = os.path.join(output_dir, "student_config.json")
-
-        # Ensure specific keys match Diffusers expectations if necessary,
-        # or just save the current config.
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=4)
-
-        # 2. Save Weights as Safetensors
-        # This is the standard format for Diffusers
-        weights_path = os.path.join(output_dir, "diffusion_model.safetensors")
-
-        # Note: We only save the state_dict here.
-        # You might need to filter keys here if the state_dict has extra keys
-        # (like 'epoch' or 'optimizer') that you don't want to save.
-        save_file(self.state_dict(), weights_path)
-
-        print(f"Model saved successfully to: {output_dir}")
 
 
 # -----------------------------------------------------------------------------
@@ -895,8 +950,18 @@ def main():
     if is_main_process(rank):
         print("\n[2/5] Initializing student model...")
     # Initialize with teacher checkpoint path to enable weight projection
+    # Pass config parameters individually to leverage @register_to_config
     student_model = WanLiteStudent(
-        student_config, 
+        model_type=student_config.get("model_type", "WanLiteStudent"),
+        hidden_size=student_config["hidden_size"],
+        depth=student_config["depth"],
+        num_heads=student_config["num_heads"],
+        num_channels=student_config["num_channels"],
+        image_size=student_config["image_size"],
+        patch_size=student_config["patch_size"],
+        text_max_length=student_config["text_max_length"],
+        text_encoder_output_dim=student_config["text_encoder_output_dim"],
+        projection_factor=student_config.get("projection_factor", 1.0),
         teacher_checkpoint_path=args.teacher_path, 
         device=device,
         distributed=args.distributed,
