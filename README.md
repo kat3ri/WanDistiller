@@ -282,6 +282,51 @@ The `projection_mapper.py` converts teacher weights:
 6. **Add More Prompts**: More diverse prompts = better generalization
 7. **Monitor Progress**: Use `--save_samples` to generate sample images during training and visually track improvement
 
+## 🎨 Using Your Trained Model
+
+### Loading in ComfyUI
+
+The trained WanLiteStudent models can be loaded directly into **ComfyUI** for image generation.
+
+**Quick answer:** Place your model in `ComfyUI/models/checkpoints/`
+
+**Detailed instructions:** See [COMFYUI_LOADING_GUIDE.md](COMFYUI_LOADING_GUIDE.md) for:
+- ✅ Step-by-step loading instructions
+- ✅ Correct folder location (checkpoints vs diffusion_models vs diffusers)
+- ✅ Required file structure and metadata
+- ✅ Troubleshooting common loading errors
+- ✅ ComfyUI compatibility requirements
+
+**Example:**
+```bash
+# Copy your trained model to ComfyUI
+cp -r output/checkpoints/epoch_10 /path/to/ComfyUI/models/checkpoints/my_model
+
+# The model will appear in ComfyUI's model loader dropdown
+```
+
+### Loading with HuggingFace Diffusers
+
+Models are saved in HuggingFace Diffusers format and can be loaded programmatically:
+
+```python
+from train_distillation import WanLiteStudent
+
+# Load a saved model
+model = WanLiteStudent.from_pretrained("output/checkpoints/epoch_10")
+model.eval()
+
+# Use for inference...
+```
+
+### Model Format
+
+Trained models are saved with:
+- ✅ `config.json` - Model architecture and metadata (includes `_class_name` for ComfyUI)
+- ✅ `diffusion_model.safetensors` - Model weights in safetensors format
+- ✅ Full HuggingFace Diffusers compatibility
+- ✅ ComfyUI loading support (see guide above)
+
 ## 🐛 Troubleshooting
 
 ### Out of Memory (OOM) Errors
@@ -435,9 +480,12 @@ If the model loading appears to hang at "Loading pipeline components: 83%", this
 
 ## 📚 Additional Documentation
 
+- [COMFYUI_LOADING_GUIDE.md](COMFYUI_LOADING_GUIDE.md) - **How to load models in ComfyUI (NEW!)**
+- [COMFY_UI_FIX_SUMMARY.md](COMFY_UI_FIX_SUMMARY.md) - ComfyUI compatibility fix details
 - [TESTING.md](TESTING.md) - Complete testing guide
 - [docs/MULTI_GPU.md](docs/MULTI_GPU.md) - **Multi-GPU training guide (NEW!)**
 - [docs/MODEL_LOADING_STRATEGIES.md](docs/MODEL_LOADING_STRATEGIES.md) - **Model loading strategies: CPU, GPU, sharding, offloading (NEW!)**
+- [docs/WAN_COMPATIBLE_SAVE_FORMAT.md](docs/WAN_COMPATIBLE_SAVE_FORMAT.md) - Model save format specification
 - [docs/UMT5_WEIGHT_LOADING.md](docs/UMT5_WEIGHT_LOADING.md) - Understanding UMT5 text encoder weight warnings
 - [docs/PIPELINE_LOADING.md](docs/PIPELINE_LOADING.md) - Troubleshooting slow pipeline loading
 - [readme.md](readme.md) - Original detailed documentation
