@@ -621,16 +621,17 @@ def generate_and_save_samples(
                 # So at t=999 (noisy): alpha≈0, at t=0 (clean): alpha≈1
                 alpha_t = 1.0 - (t.float() / 1000.0)  # t=999 -> alpha=0.001, t=0 -> alpha=1.0
                 
+                # Clamp alpha_t for numerical stability (maintain tensor type)
+                alpha_t = torch.clamp(alpha_t, min=epsilon, max=1.0 - epsilon)
+                
                 # For the previous timestep, use 1.0 for the final step to get clean output
                 if i < len(timesteps) - 1:
                     alpha_t_prev = 1.0 - (timesteps[i+1].float() / 1000.0)
+                    # Clamp alpha_t_prev for intermediate steps
+                    alpha_t_prev = torch.clamp(alpha_t_prev, min=epsilon, max=1.0 - epsilon)
                 else:
-                    # Final step: alpha_t_prev should be 1.0 for fully denoised output
+                    # Final step: alpha_t_prev should be 1.0 for fully denoised output (no clamping)
                     alpha_t_prev = torch.tensor(1.0, device=device)
-                
-                # Clamp alpha values for numerical stability (maintain tensor type)
-                alpha_t = torch.clamp(alpha_t, min=epsilon, max=1.0 - epsilon)
-                alpha_t_prev = torch.clamp(alpha_t_prev, min=epsilon, max=1.0 - epsilon)
                 
                 # Precompute square roots for efficiency
                 sqrt_alpha_t = torch.sqrt(alpha_t)
