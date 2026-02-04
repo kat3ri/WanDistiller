@@ -91,6 +91,45 @@ torchrun --nproc_per_node=4 train_distillation.py \
 
 See [docs/MULTI_GPU.md](docs/MULTI_GPU.md) for detailed multi-GPU training guide.
 
+### Sample Image Generation During Training
+
+You can optionally generate sample images from the student model during training to monitor progress:
+
+```bash
+# Enable sample generation (once per epoch by default)
+python train_distillation.py \
+    --teacher_path "Wan-AI/Wan2.2-T2V-A14B-Diffusers" \
+    --student_config "config/student_config.json" \
+    --data_path "data/static_prompts.txt" \
+    --output_dir "./outputs/wan_t2i" \
+    --num_epochs 100 \
+    --batch_size 4 \
+    --lr 1e-5 \
+    --save_samples \
+    --sample_prompts "A serene mountain landscape at sunset" "A futuristic city with neon lights"
+
+# Custom sample interval (generate every 5 epochs)
+python train_distillation.py \
+    --teacher_path "Wan-AI/Wan2.2-T2V-A14B-Diffusers" \
+    --student_config "config/student_config.json" \
+    --data_path "data/static_prompts.txt" \
+    --output_dir "./outputs/wan_t2i" \
+    --num_epochs 100 \
+    --batch_size 4 \
+    --lr 1e-5 \
+    --save_samples \
+    --sample_interval 5 \
+    --sample_dir "./outputs/wan_t2i/my_samples"
+```
+
+**Sample Generation Options:**
+- `--save_samples`: Enable sample image generation during training
+- `--sample_prompts`: Text prompts to use for generation (default: 2 example prompts)
+- `--sample_interval`: Generate samples every N epochs (default: 1, i.e., once per epoch)
+- `--sample_dir`: Directory to save samples (default: `{output_dir}/samples`)
+
+Samples are saved as `epoch_NNNN_sample_MM.png` in the sample directory, where NNNN is the epoch number and MM is the sample index.
+
 ## 📁 Project Structure
 
 ```
@@ -239,6 +278,7 @@ The `projection_mapper.py` converts teacher weights:
 4. **Batch Size**: Adjust based on available memory
 5. **Learning Rate**: 1e-5 is a good starting point
 6. **Add More Prompts**: More diverse prompts = better generalization
+7. **Monitor Progress**: Use `--save_samples` to generate sample images during training and visually track improvement
 
 ## 🐛 Troubleshooting
 
