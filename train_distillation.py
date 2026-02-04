@@ -616,6 +616,11 @@ def generate_and_save_samples(
                 alpha_t = 1.0 - (t / 1000.0)  # Linear schedule
                 alpha_t_prev = 1.0 - (timesteps[i+1] / 1000.0) if i < len(timesteps) - 1 else 1.0
                 
+                # Add small epsilon for numerical stability
+                epsilon = 1e-8
+                alpha_t = max(alpha_t, epsilon)
+                alpha_t_prev = max(alpha_t_prev, epsilon)
+                
                 # Compute predicted original sample (x_0)
                 pred_original_sample = (current_latents - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
                 
