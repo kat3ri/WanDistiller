@@ -512,6 +512,152 @@ def load_config(json_path):
 
 
 # -----------------------------------------------------------------------------
+# Sample Image Generation
+# -----------------------------------------------------------------------------
+
+def generate_and_save_samples(
+    student_model, 
+    teacher_text_encoder, 
+    teacher_vae, 
+    teacher_wan,
+    sample_prompts, 
+    sample_dir, 
+    epoch, 
+    device,
+    teacher_device,
+    teacher_dtype,
+    student_config,
+    proj_layer=None
+):
+    """
+    Generate sample images from the student model and save them.
+    
+    Args:
+        student_model: The student model to generate samples from
+        teacher_text_encoder: Teacher's text encoder for encoding prompts
+        teacher_vae: Teacher's VAE for decoding latents to images
+        teacher_wan: Teacher WAN model (for accessing configuration)
+        sample_prompts: List of text prompts to generate images for
+        sample_dir: Directory to save sample images
+        epoch: Current epoch number
+        device: Device for student model
+        teacher_device: Device for teacher model components
+        teacher_dtype: Data type for teacher model
+        student_config: Student model configuration
+        proj_layer: Optional projection layer for channel conversion
+    """
+    import os
+    from torchvision.utils import save_image
+    
+    # Create sample directory if it doesn't exist
+    os.makedirs(sample_dir, exist_ok=True)
+    
+    # Set student model to eval mode
+    student_model.eval()
+    
+    try:
+        with torch.no_grad():
+            # Encode prompts using teacher's text encoder
+            if teacher_text_encoder is not None:
+                if teacher_wan.t5_cpu:
+                    text_embeddings_list = teacher_text_encoder(sample_prompts, torch.device('cpu'))
+                    text_embeddings_list = [t.to(device) for t in text_embeddings_list]
+                else:
+                    text_embeddings_list = teacher_text_encoder(sample_prompts, teacher_device)
+                
+                # Stack and pad to create batch tensor
+                max_len = max(t.shape[0] for t in text_embeddings_list)
+                batch_size = len(text_embeddings_list)
+                embed_dim = text_embeddings_list[0].shape[1]
+                
+                text_embeddings = torch.zeros(
+                    batch_size, max_len, embed_dim,
+                    dtype=text_embeddings_list[0].dtype,
+                    device=device
+                )
+                for i, emb in enumerate(text_embeddings_list):
+                    text_embeddings[i, :emb.shape[0], :] = emb
+            else:
+                raise ValueError("No text encoder found")
+            
+            # Generate initial noise latents
+            latents = torch.randn(
+                batch_size,
+                student_config["num_channels"],
+                student_config["image_size"] // student_config["patch_size"],
+                student_config["image_size"] // student_config["patch_size"],
+                device=device
+            )
+            
+            # Simple denoising: start from high noise and denoise with a single step
+            # This is a simplified sampling - proper DDPM/DDIM sampling would be better
+            # but requires implementing a full sampling loop
+            # NOTE: Samples generated this way will be noisy and are intended only for
+            # rough progress monitoring, not final quality assessment
+            timestep = torch.ones(batch_size, device=device).long() * 500
+            
+            # Get student prediction
+            student_output = student_model(
+                latent_0=latents,
+                latent_1=None,
+                timestep=timestep,
+                encoder_hidden_states=text_embeddings,
+            )
+            
+            # Apply student's prediction to get denoised latents
+            # Using a simple mixing factor (alpha=0.5) to balance between original noise
+            # and predicted noise. This is a heuristic for quick sample generation.
+            DENOISING_ALPHA = 0.5
+            denoised_latents = latents - DENOISING_ALPHA * student_output
+            
+            # Convert to format expected by VAE (add temporal dimension for teacher VAE)
+            # VAE expects [C, F, H, W] format in a list
+            if denoised_latents.dim() == 4:
+                # Standard case: [B, C, H, W] -> list of [C, 1, H, W]
+                vae_latents_list = [denoised_latents[i].unsqueeze(1) for i in range(denoised_latents.shape[0])]
+            else:
+                raise ValueError(f"Unexpected latent dimensions: {denoised_latents.shape}. Expected 4D tensor [B, C, H, W]")
+            
+            # Apply projection if needed
+            if proj_layer is not None:
+                vae_latents_batch = torch.stack(vae_latents_list)
+                vae_latents_batch = proj_layer(vae_latents_batch)
+                vae_latents_list = [vae_latents_batch[i] for i in range(vae_latents_batch.shape[0])]
+            
+            # Move to VAE device and dtype
+            vae_latents_list = [z.to(device=teacher_device, dtype=teacher_dtype) for z in vae_latents_list]
+            
+            # Decode latents to images using teacher's VAE
+            decoded_videos = teacher_vae.decode(vae_latents_list)
+            
+            # Save each generated image
+            for i, video in enumerate(decoded_videos):
+                # video shape is [C, F, H, W], take first frame
+                # Convert from [-1, 1] range to [0, 1]
+                image = video[:, 0, :, :]  # Take first frame: [C, H, W]
+                image = (image + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                image = image.clamp(0, 1)
+                
+                # Save image using torchvision
+                filename = f"epoch_{epoch:04d}_sample_{i:02d}.png"
+                filepath = os.path.join(sample_dir, filename)
+                save_image(image.cpu(), filepath)
+                
+                print(f"  Saved sample {i+1}/{batch_size}: {filepath}")
+        
+        print(f"✓ Generated and saved {batch_size} sample images for epoch {epoch}")
+        
+    except Exception as e:
+        print(f"Warning: Failed to generate samples: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        # Set student model back to train mode
+        student_model.train()
+
+
+# -----------------------------------------------------------------------------
 # Main Training Logic
 # -----------------------------------------------------------------------------
 
@@ -554,6 +700,18 @@ def main():
                         help="Use mixed precision (FP16) training to reduce memory usage")
     parser.add_argument("--teacher_dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"],
                         help="Data type for teacher model (float16/bfloat16 use less memory)")
+    
+    # Sample generation arguments
+    parser.add_argument("--save_samples", action="store_true",
+                        help="Enable saving sample images during training")
+    parser.add_argument("--sample_dir", type=str, default=None,
+                        help="Directory to save sample images (default: {output_dir}/samples)")
+    parser.add_argument("--sample_prompts", type=str, nargs="+", 
+                        default=None,
+                        help="Prompts to use for sample generation (default: first 2 prompts from training data). "
+                             "It's recommended to choose prompts representative of your training data domain.")
+    parser.add_argument("--sample_interval", type=int, default=1,
+                        help="Generate samples every N epochs (default: 1, i.e., once per epoch)")
 
     args = parser.parse_args()
 
@@ -815,6 +973,34 @@ def main():
     # 8. Optimizer and Loss
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=args.lr)
     loss_fn = torch.nn.functional.mse_loss
+    
+    # 8.5. Setup sample generation directory if enabled
+    sample_dir = None
+    if args.save_samples:
+        # Set default sample directory if not provided
+        if args.sample_dir is None:
+            sample_dir = os.path.join(args.output_dir, "samples")
+        else:
+            sample_dir = args.sample_dir
+        
+        # Set default sample prompts if not provided (use first 2 from dataset)
+        if args.sample_prompts is None:
+            if len(dataset) >= 2:
+                args.sample_prompts = [dataset[0], dataset[1]]
+            elif len(dataset) == 1:
+                args.sample_prompts = [dataset[0]]
+            else:
+                # Fallback to generic prompts if dataset is empty
+                args.sample_prompts = ["A test image", "Another test image"]
+                if is_main_process(rank):
+                    print("Warning: Using generic default prompts. Consider specifying --sample_prompts.")
+        
+        # Only create directory on main process
+        if is_main_process(rank):
+            os.makedirs(sample_dir, exist_ok=True)
+            print(f"Sample images will be saved to: {sample_dir}")
+            print(f"Sample prompts: {args.sample_prompts}")
+            print(f"Sample generation interval: every {args.sample_interval} epoch(s)")
     
     # MEMORY OPTIMIZATION: Pre-create projection layer if needed
     # This avoids recreating it every batch which causes memory leaks
@@ -1105,6 +1291,36 @@ def main():
                 
                 # Exit with error code instead of raising to avoid confusing errors
                 sys.exit(1)
+        
+        # End of epoch - generate sample images if enabled
+        if args.save_samples and is_main_process(rank):
+            # Check if we should generate samples this epoch
+            if (epoch + 1) % args.sample_interval == 0:
+                print(f"\n[Epoch {epoch+1}] Generating sample images...")
+                
+                # Only generate samples if we have the necessary components
+                if teacher_text_encoder is not None and teacher_vae is not None and teacher_wan is not None:
+                    # Unwrap model if using DataParallel or DistributedDataParallel
+                    model_for_sampling = student_model.module if hasattr(student_model, 'module') else student_model
+                    
+                    generate_and_save_samples(
+                        student_model=model_for_sampling,
+                        teacher_text_encoder=teacher_text_encoder,
+                        teacher_vae=teacher_vae,
+                        teacher_wan=teacher_wan,
+                        sample_prompts=args.sample_prompts,
+                        sample_dir=sample_dir,
+                        epoch=epoch + 1,
+                        device=device,
+                        teacher_device=teacher_device,
+                        teacher_dtype=teacher_dtype,
+                        student_config=student_config,
+                        proj_layer=proj_layer
+                    )
+                else:
+                    print(f"  Warning: Cannot generate samples - missing teacher components")
+                
+                print()  # Add blank line for readability
 
     # 10. Save Model (only from main process)
     if is_main_process(rank):
