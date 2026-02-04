@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -160,12 +161,15 @@ def setup_distributed():
     
     # Initialize the distributed process group
     # The NCCL backend will use the device set by torch.cuda.set_device()
+    # Set a longer timeout (1 hour) to allow for sample generation during training
+    # which can take longer than the default 10 minutes
     try:
         dist.init_process_group(
             backend='nccl', 
             init_method='env://', 
             world_size=world_size, 
-            rank=rank
+            rank=rank,
+            timeout=datetime.timedelta(seconds=3600)  # 1 hour timeout
         )
         dist.barrier()
     except Exception as e:
@@ -527,10 +531,15 @@ def generate_and_save_samples(
     teacher_device,
     teacher_dtype,
     student_config,
-    proj_layer=None
+    proj_layer=None,
+    rank=0,
+    world_size=1
 ):
     """
     Generate sample images from the student model and save them.
+    
+    This function can be called by multiple processes in distributed training.
+    Each process will generate samples for a subset of the prompts.
     
     Args:
         student_model: The student model to generate samples from
@@ -545,12 +554,35 @@ def generate_and_save_samples(
         teacher_dtype: Data type for teacher model
         student_config: Student model configuration
         proj_layer: Optional projection layer for channel conversion
+        rank: Process rank for distributed training (default: 0)
+        world_size: Total number of processes (default: 1)
     """
     import os
     from torchvision.utils import save_image
     
     # Create sample directory if it doesn't exist
     os.makedirs(sample_dir, exist_ok=True)
+    
+    # Distribute prompts across processes for parallel generation
+    # Each process handles a subset of prompts
+    import math
+    num_prompts = len(sample_prompts)
+    prompts_per_rank = math.ceil(num_prompts / world_size)
+    start_idx = rank * prompts_per_rank
+    end_idx = min(start_idx + prompts_per_rank, num_prompts)
+    
+    # Get this rank's subset of prompts
+    my_prompts = sample_prompts[start_idx:end_idx]
+    
+    # Skip if this rank has no prompts to process
+    if len(my_prompts) == 0:
+        if rank == 0:
+            print(f"✓ Sample generation complete (no prompts for rank {rank})")
+        return
+    
+    if rank == 0:
+        print(f"  Distributing {num_prompts} prompts across {world_size} GPU(s)")
+        print(f"  Each GPU will generate ~{prompts_per_rank} sample(s)")
     
     # Set student model to eval mode
     student_model.eval()
@@ -560,10 +592,10 @@ def generate_and_save_samples(
             # Encode prompts using teacher's text encoder
             if teacher_text_encoder is not None:
                 if teacher_wan.t5_cpu:
-                    text_embeddings_list = teacher_text_encoder(sample_prompts, torch.device('cpu'))
+                    text_embeddings_list = teacher_text_encoder(my_prompts, torch.device('cpu'))
                     text_embeddings_list = [t.to(device) for t in text_embeddings_list]
                 else:
-                    text_embeddings_list = teacher_text_encoder(sample_prompts, teacher_device)
+                    text_embeddings_list = teacher_text_encoder(my_prompts, teacher_device)
                 
                 # Stack and pad to create batch tensor
                 max_len = max(t.shape[0] for t in text_embeddings_list)
@@ -679,16 +711,23 @@ def generate_and_save_samples(
                 image = image.clamp(0, 1)
                 
                 # Save image using torchvision
-                filename = f"epoch_{epoch:04d}_sample_{i:02d}.png"
+                # Include rank in filename to avoid conflicts across processes
+                filename = f"epoch_{epoch:04d}_rank_{rank}_sample_{i:02d}.png"
                 filepath = os.path.join(sample_dir, filename)
                 save_image(image.cpu(), filepath)
                 
-                print(f"  Saved sample {i+1}/{batch_size}: {filepath}")
+                # Log sample generation (reduce verbosity for large batches)
+                VERBOSE_LOGGING_THRESHOLD = 4
+                if rank == 0 or len(my_prompts) <= VERBOSE_LOGGING_THRESHOLD:
+                    print(f"  [Rank {rank}] Saved sample {i+1}/{batch_size}: {filepath}")
         
-        print(f"✓ Generated and saved {batch_size} sample images for epoch {epoch}")
+        if rank == 0:
+            print(f"✓ All GPUs completed sample generation for epoch {epoch}")
+        else:
+            print(f"  [Rank {rank}] Generated {batch_size} sample(s)")
         
     except Exception as e:
-        print(f"Warning: Failed to generate samples: {str(e)}")
+        print(f"[Rank {rank}] Warning: Failed to generate samples: {str(e)}")
         import traceback
         traceback.print_exc()
     
@@ -1419,35 +1458,45 @@ def main():
         if args.save_samples:
             # Check if we should generate samples this epoch
             if (epoch + 1) % args.sample_interval == 0:
+                # Print message only from main process
                 if is_main_process(rank):
                     print(f"\n[Epoch {epoch+1}] Generating sample images...")
+                
+                # ALL processes participate in sample generation for parallel speedup
+                # Only generate samples if we have the necessary components
+                if teacher_text_encoder is not None and teacher_vae is not None and teacher_wan is not None:
+                    # Unwrap model if using DataParallel or DistributedDataParallel
+                    model_for_sampling = student_model.module if hasattr(student_model, 'module') else student_model
                     
-                    # Only generate samples if we have the necessary components
-                    if teacher_text_encoder is not None and teacher_vae is not None and teacher_wan is not None:
-                        # Unwrap model if using DataParallel or DistributedDataParallel
-                        model_for_sampling = student_model.module if hasattr(student_model, 'module') else student_model
-                        
-                        generate_and_save_samples(
-                            student_model=model_for_sampling,
-                            teacher_text_encoder=teacher_text_encoder,
-                            teacher_vae=teacher_vae,
-                            teacher_wan=teacher_wan,
-                            sample_prompts=args.sample_prompts,
-                            sample_dir=sample_dir,
-                            epoch=epoch + 1,
-                            device=device,
-                            teacher_device=teacher_device,
-                            teacher_dtype=teacher_dtype,
-                            student_config=student_config,
-                            proj_layer=proj_layer
-                        )
-                    else:
+                    # Determine world_size for distribution
+                    current_world_size = world_size if args.distributed else 1
+                    current_rank = rank if args.distributed else 0
+                    
+                    generate_and_save_samples(
+                        student_model=model_for_sampling,
+                        teacher_text_encoder=teacher_text_encoder,
+                        teacher_vae=teacher_vae,
+                        teacher_wan=teacher_wan,
+                        sample_prompts=args.sample_prompts,
+                        sample_dir=sample_dir,
+                        epoch=epoch + 1,
+                        device=device,
+                        teacher_device=teacher_device,
+                        teacher_dtype=teacher_dtype,
+                        student_config=student_config,
+                        proj_layer=proj_layer,
+                        rank=current_rank,
+                        world_size=current_world_size
+                    )
+                else:
+                    if is_main_process(rank):
                         print(f"  Warning: Cannot generate samples - missing teacher components")
-                    
+                
+                if is_main_process(rank):
                     print()  # Add blank line for readability
                 
                 # Synchronize all processes after sample generation in distributed mode
-                # This prevents other processes from continuing while main process generates samples
+                # This ensures all processes have finished their sample generation work
                 if args.distributed:
                     dist.barrier()
 
