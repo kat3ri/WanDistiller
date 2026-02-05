@@ -410,10 +410,14 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         # Loads weights from the teacher checkpoint and maps them to the student architecture
         # This handles converting 3D video model weights to 2D image model weights
         if teacher_checkpoint_path is not None:
-            print(f"Loading teacher weights from: {teacher_checkpoint_path}")
-            # For now, skip the projection mapper as it expects state_dict not a path
-            # The projection mapper would need to be updated to handle HuggingFace model loading
-            print("Note: Weight projection from teacher model is not yet implemented for HuggingFace models")
+            print(f"[Student Model] Loading teacher weights from: {teacher_checkpoint_path}")
+            # Use the projection mapper to load and project teacher weights
+            load_and_project_weights(
+                student_model=self,
+                teacher_checkpoint_path=teacher_checkpoint_path,
+                config=config,
+                device=device if device is not None else 'cpu'
+            )
 
     def forward(self, latent_0, latent_1, timestep, encoder_hidden_states):
         """
