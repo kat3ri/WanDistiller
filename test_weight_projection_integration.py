@@ -112,6 +112,7 @@ def create_student_model():
             self.conv_out = nn.Conv2d(128, 4, kernel_size=3, padding=1)
         
         def forward(self, x):
+            # Return input unchanged (intentionally simple for testing purposes)
             return x
     
     return StudentModel()

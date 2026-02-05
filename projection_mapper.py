@@ -187,7 +187,7 @@ def project_weight_dimensions(teacher_weight, student_shape, method='truncate'):
                 pad_w = (kw_s - kw_t) // 2
                 projected = torch.nn.functional.pad(
                     projected, 
-                    (pad_w, kh_s - kh_t - pad_w, pad_h, kw_s - kw_t - pad_h)
+                    (pad_w, kw_s - kw_t - pad_w, pad_h, kh_s - kh_t - pad_h)
                 )
         
         # Scale to preserve variance
