@@ -60,10 +60,11 @@ torchrun --nproc_per_node=$NPROC_PER_NODE train_distillation.py \
     --student_config "config/student_config.json" \
     --data_path "data/static_prompts.txt" \
     --output_dir "./outputs/wan_t2i" \
-    --num_epochs 20 \
+    --num_epochs 1000 \
     --batch_size 1 \
     --lr 1e-5 \
-    --gradient_checkpointing 
+    --gradient_checkpointing \
+    --num_steps 10000
 #    --save_samples \
 #    --sample_prompts "A mountain landscape" "A city at night" "a woman standing in a field of sunflowers" \
 #    --sample_interval 10

@@ -111,7 +111,9 @@ def main():
             output_proj_layer.eval()
             print("✓ Output projection layer loaded.")
         else:
-            print(f"❌ ERROR: Channel mismatch but no projection layer found at {proj_path}. The model cannot be used for inference.", file=sys.stderr)
+            print(f"❌ ERROR: Channel mismatch but no projection layer found at '{proj_path}'.", file=sys.stderr)
+            print(f"   This file is necessary for inference when student and VAE channels differ.", file=sys.stderr)
+            print(f"   Please retrain the model with the latest 'train_distillation.py' script to generate this file.", file=sys.stderr)
             sys.exit(1)
 
     # 3. Inference loop

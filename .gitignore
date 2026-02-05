@@ -8,3 +8,4 @@ __pycache__/
 outputs/
 Wan2.2-T2V-A14B/
 venv/
+inference_result.png
