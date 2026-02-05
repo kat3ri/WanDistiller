@@ -20,6 +20,7 @@ import os
 import sys
 import warnings
 
+from safetensors.torch import load_file
 # Add the directory containing train_distillation to the Python path
 # This is necessary to import WanLiteStudent
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -89,6 +90,30 @@ def main():
         print(f"   Error details: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # 2b. Load output projection layer if channel mismatch exists
+    output_proj_layer = None
+    student_config = student_model.config
+    # The teacher VAE's latent dimension is 16 for Wan2.2
+    vae_z_dim = teacher_vae.model.z_dim if hasattr(teacher_vae, 'model') and hasattr(teacher_vae.model, 'z_dim') else 16
+
+    if student_config.num_channels != vae_z_dim:
+        proj_path = os.path.join(args.model_path, "output_proj.safetensors")
+        print(f"Student ({student_config.num_channels}ch) and VAE ({vae_z_dim}ch) channel counts differ. Looking for projection layer...")
+        
+        if os.path.exists(proj_path):
+            print(f"Loading output projection layer from {proj_path}...")
+            output_proj_layer = torch.nn.Conv2d(
+                in_channels=student_config.num_channels,
+                out_channels=vae_z_dim,
+                kernel_size=1
+            ).to(device)
+            output_proj_layer.load_state_dict(load_file(proj_path, device=str(device)))
+            output_proj_layer.eval()
+            print("✓ Output projection layer loaded.")
+        else:
+            print(f"❌ ERROR: Channel mismatch but no projection layer found at {proj_path}. The model cannot be used for inference.", file=sys.stderr)
+            sys.exit(1)
+
     # 3. Inference loop
     with torch.no_grad():
         # Encode prompt
@@ -134,6 +159,11 @@ def main():
 
         denoised_latents = current_latents
         print("✓ Denoising complete.")
+
+        # Apply the projection layer to match VAE's expected channel dimension
+        if output_proj_layer is not None:
+            print(f"Applying output projection: {student_config.num_channels} -> {vae_z_dim} channels")
+            denoised_latents = output_proj_layer(denoised_latents)
 
         # Decode latents
         print("Decoding latents with VAE...")

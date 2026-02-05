@@ -1565,6 +1565,14 @@ def main():
         # Unwrap model if using DataParallel or DistributedDataParallel
         model_to_save = student_model.module if hasattr(student_model, 'module') else student_model
         model_to_save.save_pretrained(args.output_dir)
+
+        # Save the output projection layer if it exists
+        if output_proj_layer is not None:
+            output_proj_path = os.path.join(args.output_dir, "output_proj.safetensors")
+            print(f"Saving output projection layer to: {output_proj_path}")
+            save_file(output_proj_layer.state_dict(), output_proj_path)
+            print("✓ Output projection layer saved.")
+
         print("Training complete.")
     
     # Clean up distributed training
