@@ -377,6 +377,15 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
             text_max_length = config["text_max_length"]
             text_encoder_output_dim = config["text_encoder_output_dim"]
             projection_factor = config.get("projection_factor", 1.0)
+        else:
+            # Create a simple config object with current parameters
+            # This is needed for load_and_project_weights
+            class SimpleConfig:
+                pass
+            config = SimpleConfig()
+            config.hidden_size = hidden_size
+            config.depth = depth
+            config.num_heads = num_heads
         
         super().__init__()
         
@@ -416,7 +425,7 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
                 student_model=self,
                 teacher_checkpoint_path=teacher_checkpoint_path,
                 config=config,
-                device=device if device is not None else 'cpu'
+                device='cpu'  # Model will be moved to device later
             )
 
     def forward(self, latent_0, latent_1, timestep, encoder_hidden_states):

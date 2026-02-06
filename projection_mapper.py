@@ -52,15 +52,50 @@ def load_teacher_state_dict(teacher_checkpoint_path):
             else:
                 return checkpoint
     
-    # Try to load as HuggingFace model
-    print(f"[Projection] Loading teacher from HuggingFace: {teacher_checkpoint_path}")
+    # Try to load as HuggingFace model or WAN directory
+    print(f"[Projection] Attempting to load teacher from directory: {teacher_checkpoint_path}")
     try:
         # Import here to avoid dependency if not needed
-        from wan.text2video import WanT2V
-        teacher_model = WanT2V.from_pretrained(teacher_checkpoint_path)
-        return teacher_model.state_dict()
+        from wan.text2video import WanT2V, _is_huggingface_format
+        from wan.modules.model import WanModel
+        
+        # Check if it's a directory with WAN models
+        if isinstance(teacher_checkpoint_path, (str, Path)) and os.path.isdir(str(teacher_checkpoint_path)):
+            is_hf_format = _is_huggingface_format(teacher_checkpoint_path)
+            print(f"[Projection] Directory format detected: {'HuggingFace' if is_hf_format else 'Local'}")
+            
+            # Try to load the transformer model directly using WanModel
+            if is_hf_format:
+                # HuggingFace format: load from transformer subfolder
+                subfolder = 'transformer'
+            else:
+                # Local format: try low_noise_model subfolder
+                subfolder = 'low_noise_model'
+            
+            try:
+                print(f"[Projection] Loading WanModel from subfolder: {subfolder}")
+                teacher_model = WanModel.from_pretrained(teacher_checkpoint_path, subfolder=subfolder)
+                state_dict = teacher_model.state_dict()
+                print(f"[Projection] Successfully loaded {len(state_dict)} keys from teacher model")
+                return state_dict
+            except Exception as e:
+                print(f"[Projection] Could not load from {subfolder}: {e}")
+                # Try alternate subfolder
+                alt_subfolder = 'transformer_2' if is_hf_format else 'high_noise_model'
+                try:
+                    print(f"[Projection] Trying alternate subfolder: {alt_subfolder}")
+                    teacher_model = WanModel.from_pretrained(teacher_checkpoint_path, subfolder=alt_subfolder)
+                    state_dict = teacher_model.state_dict()
+                    print(f"[Projection] Successfully loaded {len(state_dict)} keys from teacher model")
+                    return state_dict
+                except Exception as e2:
+                    print(f"[Projection] Could not load from {alt_subfolder}: {e2}")
+        
+        print(f"[Projection] Could not load teacher model from any known format")
+        print(f"[Projection] Returning empty state_dict")
+        return {}
     except Exception as e:
-        print(f"[Projection] Warning: Could not load HuggingFace model: {e}")
+        print(f"[Projection] Warning: Error loading teacher model: {e}")
         print(f"[Projection] Returning empty state_dict")
         return {}
 
