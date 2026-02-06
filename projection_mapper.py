@@ -295,7 +295,7 @@ def map_teacher_to_student_key(student_key, student_block_idx, layer_mapping):
         
     Returns:
         List of (teacher_key, slice_info) tuples for mapping teacher params to student.
-        slice_info is None for direct copy, or (dim, start, end) for slicing.
+        slice_info is None for direct copy, or ('cat', dim) for concatenation along dim.
     """
     # Map student block index to teacher block index
     teacher_block_idx = layer_mapping[student_block_idx] if student_block_idx < len(layer_mapping) else student_block_idx
@@ -407,6 +407,9 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
         'skipped': 0,
         'conv3d_to_2d': 0
     }
+    
+    # Logging configuration
+    MAX_PROJECTION_LOGS = 10  # Maximum number of projection messages to print
 
     # Iterate over student parameters
     for student_key, student_param in student_state_dict.items():
@@ -492,7 +495,7 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
                                         )
                                         student_param.data.copy_(projected.to(student_param.device))
                                         projection_stats['projected'] += 1
-                                        if projection_stats['projected'] <= 5:  # Only print first few
+                                        if projection_stats['projected'] <= MAX_PROJECTION_LOGS:
                                             print(f"[Projection] Projected {student_key} (concat from {len(teacher_params)} params): {concatenated.shape} → {student_param.shape}")
                                         transferred = True
                                 except Exception as e:
@@ -522,7 +525,7 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
                                         )
                                         student_param.data.copy_(projected.to(student_param.device))
                                         projection_stats['projected'] += 1
-                                        if projection_stats['projected'] <= 10:  # Print first few
+                                        if projection_stats['projected'] <= MAX_PROJECTION_LOGS:
                                             teacher_block_idx = layer_mapping[student_block_idx] if student_block_idx < len(layer_mapping) else student_block_idx
                                             print(f"[Projection] Projected {student_key} (from layer {teacher_block_idx}): {teacher_param.shape} → {student_param.shape}")
                                         transferred = True

@@ -5,6 +5,10 @@ Test projection mapper key coverage.
 This test verifies that all student model parameters can be mapped to teacher
 parameters using the projection mapper logic, without requiring torch or other
 heavy dependencies.
+
+NOTE: map_teacher_to_student_key() is intentionally duplicated here instead of
+imported to make this test runnable without torch/safetensors dependencies.
+This allows for quick validation of the key mapping logic during development.
 """
 
 import sys
