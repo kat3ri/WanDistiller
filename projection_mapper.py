@@ -79,7 +79,7 @@ def load_teacher_state_dict(teacher_checkpoint_path):
                 print(f"[Projection] Successfully loaded {len(state_dict)} keys from teacher model")
                 return state_dict
             except Exception as e:
-                print(f"[Projection] Could not load from {subfolder}: {e}")
+                print(f"[Projection] Could not load from {subfolder}: {type(e).__name__}: {e}")
                 # Try alternate subfolder
                 alt_subfolder = 'transformer_2' if is_hf_format else 'high_noise_model'
                 try:
@@ -89,14 +89,17 @@ def load_teacher_state_dict(teacher_checkpoint_path):
                     print(f"[Projection] Successfully loaded {len(state_dict)} keys from teacher model")
                     return state_dict
                 except Exception as e2:
-                    print(f"[Projection] Could not load from {alt_subfolder}: {e2}")
+                    print(f"[Projection] Could not load from {alt_subfolder}: {type(e2).__name__}: {e2}")
         
-        print(f"[Projection] Could not load teacher model from any known format")
-        print(f"[Projection] Returning empty state_dict")
+        print(f"[Projection] ERROR: Could not load teacher model from any known format")
+        print(f"[Projection] Path attempted: {teacher_checkpoint_path}")
+        print(f"[Projection] WARNING: Returning empty state_dict - training will use random initialization")
         return {}
     except Exception as e:
-        print(f"[Projection] Warning: Error loading teacher model: {e}")
-        print(f"[Projection] Returning empty state_dict")
+        print(f"[Projection] ERROR: Exception while loading teacher model")
+        print(f"[Projection] Exception type: {type(e).__name__}")
+        print(f"[Projection] Exception message: {e}")
+        print(f"[Projection] WARNING: Returning empty state_dict - training will use random initialization")
         return {}
 
 

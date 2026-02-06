@@ -23,6 +23,15 @@ from wan.text2video import WanT2V
 from wan.configs.wan_t2v_A14B import t2v_A14B
 
 
+# Simple configuration holder for projection mapping
+class SimpleConfig:
+    """Lightweight config holder for weight projection when using individual parameters."""
+    def __init__(self, hidden_size, depth, num_heads):
+        self.hidden_size = hidden_size
+        self.depth = depth
+        self.num_heads = num_heads
+
+
 # -----------------------------------------------------------------------------
 # Validation and Error Detection
 # -----------------------------------------------------------------------------
@@ -378,14 +387,8 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
             text_encoder_output_dim = config["text_encoder_output_dim"]
             projection_factor = config.get("projection_factor", 1.0)
         else:
-            # Create a simple config object with current parameters
-            # This is needed for load_and_project_weights
-            class SimpleConfig:
-                pass
-            config = SimpleConfig()
-            config.hidden_size = hidden_size
-            config.depth = depth
-            config.num_heads = num_heads
+            # Create a config object with current parameters for load_and_project_weights
+            config = SimpleConfig(hidden_size, depth, num_heads)
         
         super().__init__()
         
@@ -421,11 +424,12 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         if teacher_checkpoint_path is not None:
             print(f"[Student Model] Loading teacher weights from: {teacher_checkpoint_path}")
             # Use the projection mapper to load and project teacher weights
+            # Note: Model is initialized on CPU and moved to device after initialization (see line ~970)
             load_and_project_weights(
                 student_model=self,
                 teacher_checkpoint_path=teacher_checkpoint_path,
                 config=config,
-                device='cpu'  # Model will be moved to device later
+                device='cpu'
             )
 
     def forward(self, latent_0, latent_1, timestep, encoder_hidden_states):
