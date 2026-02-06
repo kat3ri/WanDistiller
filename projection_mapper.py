@@ -315,7 +315,13 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
     teacher_state_dict = load_teacher_state_dict(teacher_checkpoint_path)
     
     if not teacher_state_dict:
-        print(f"[Projection] Warning: Empty teacher state_dict, skipping projection")
+        print(f"[Projection] ================================================================================")
+        print(f"[Projection] WARNING: Empty teacher state_dict - NO WEIGHT TRANSFER WILL OCCUR")
+        print(f"[Projection] ================================================================================")
+        print(f"[Projection] The student model will be trained from random initialization.")
+        print(f"[Projection] This may significantly impact model quality and training time.")
+        print(f"[Projection] Please verify the teacher checkpoint path: {teacher_checkpoint_path}")
+        print(f"[Projection] ================================================================================")
         return student_model
     
     student_state_dict = student_model.state_dict()
