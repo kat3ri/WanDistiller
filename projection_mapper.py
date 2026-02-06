@@ -52,16 +52,54 @@ def load_teacher_state_dict(teacher_checkpoint_path):
             else:
                 return checkpoint
     
-    # Try to load as HuggingFace model
-    print(f"[Projection] Loading teacher from HuggingFace: {teacher_checkpoint_path}")
+    # Try to load as HuggingFace model or WAN directory
+    print(f"[Projection] Attempting to load teacher from directory: {teacher_checkpoint_path}")
     try:
         # Import here to avoid dependency if not needed
-        from wan.text2video import WanT2V
-        teacher_model = WanT2V.from_pretrained(teacher_checkpoint_path)
-        return teacher_model.state_dict()
+        from wan.text2video import WanT2V, _is_huggingface_format
+        from wan.modules.model import WanModel
+        
+        # Check if it's a directory with WAN models
+        if isinstance(teacher_checkpoint_path, (str, Path)) and os.path.isdir(str(teacher_checkpoint_path)):
+            is_hf_format = _is_huggingface_format(teacher_checkpoint_path)
+            print(f"[Projection] Directory format detected: {'HuggingFace' if is_hf_format else 'Local'}")
+            
+            # Try to load the transformer model directly using WanModel
+            if is_hf_format:
+                # HuggingFace format: load from transformer subfolder
+                subfolder = 'transformer'
+            else:
+                # Local format: try low_noise_model subfolder
+                subfolder = 'low_noise_model'
+            
+            try:
+                print(f"[Projection] Loading WanModel from subfolder: {subfolder}")
+                teacher_model = WanModel.from_pretrained(teacher_checkpoint_path, subfolder=subfolder)
+                state_dict = teacher_model.state_dict()
+                print(f"[Projection] Successfully loaded {len(state_dict)} keys from teacher model")
+                return state_dict
+            except Exception as e:
+                print(f"[Projection] Could not load from {subfolder}: {type(e).__name__}: {e}")
+                # Try alternate subfolder
+                alt_subfolder = 'transformer_2' if is_hf_format else 'high_noise_model'
+                try:
+                    print(f"[Projection] Trying alternate subfolder: {alt_subfolder}")
+                    teacher_model = WanModel.from_pretrained(teacher_checkpoint_path, subfolder=alt_subfolder)
+                    state_dict = teacher_model.state_dict()
+                    print(f"[Projection] Successfully loaded {len(state_dict)} keys from teacher model")
+                    return state_dict
+                except Exception as e2:
+                    print(f"[Projection] Could not load from {alt_subfolder}: {type(e2).__name__}: {e2}")
+        
+        print(f"[Projection] ERROR: Could not load teacher model from any known format")
+        print(f"[Projection] Path attempted: {teacher_checkpoint_path}")
+        print(f"[Projection] WARNING: Returning empty state_dict - training will use random initialization")
+        return {}
     except Exception as e:
-        print(f"[Projection] Warning: Could not load HuggingFace model: {e}")
-        print(f"[Projection] Returning empty state_dict")
+        print(f"[Projection] ERROR: Exception while loading teacher model")
+        print(f"[Projection] Exception type: {type(e).__name__}")
+        print(f"[Projection] Exception message: {e}")
+        print(f"[Projection] WARNING: Returning empty state_dict - training will use random initialization")
         return {}
 
 
@@ -277,7 +315,13 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
     teacher_state_dict = load_teacher_state_dict(teacher_checkpoint_path)
     
     if not teacher_state_dict:
-        print(f"[Projection] Warning: Empty teacher state_dict, skipping projection")
+        print(f"[Projection] ================================================================================")
+        print(f"[Projection] WARNING: Empty teacher state_dict - NO WEIGHT TRANSFER WILL OCCUR")
+        print(f"[Projection] ================================================================================")
+        print(f"[Projection] The student model will be trained from random initialization.")
+        print(f"[Projection] This may significantly impact model quality and training time.")
+        print(f"[Projection] Please verify the teacher checkpoint path: {teacher_checkpoint_path}")
+        print(f"[Projection] ================================================================================")
         return student_model
     
     student_state_dict = student_model.state_dict()

@@ -23,6 +23,15 @@ from wan.text2video import WanT2V
 from wan.configs.wan_t2v_A14B import t2v_A14B
 
 
+# Simple configuration holder for projection mapping
+class SimpleConfig:
+    """Lightweight config holder for weight projection when using individual parameters."""
+    def __init__(self, hidden_size, depth, num_heads):
+        self.hidden_size = hidden_size
+        self.depth = depth
+        self.num_heads = num_heads
+
+
 # -----------------------------------------------------------------------------
 # Validation and Error Detection
 # -----------------------------------------------------------------------------
@@ -365,7 +374,8 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         """
         # Handle backward compatibility: if model_type is a dict, extract params
         # Note: This is for backward compatibility only. New code should pass individual params.
-        if isinstance(model_type, dict):
+        is_dict_init = isinstance(model_type, dict)
+        if is_dict_init:
             config = model_type
             model_type = config.get("model_type", "WanLiteStudent")
             hidden_size = config["hidden_size"]
@@ -377,8 +387,30 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
             text_max_length = config["text_max_length"]
             text_encoder_output_dim = config["text_encoder_output_dim"]
             projection_factor = config.get("projection_factor", 1.0)
+        else:
+            # Create a config object with current parameters for load_and_project_weights
+            config = SimpleConfig(hidden_size, depth, num_heads)
         
         super().__init__()
+        
+        # Fix config when using backward compatibility (dict initialization)
+        # The @register_to_config decorator captures the dict, but we need individual values
+        if is_dict_init:
+            # Manually update self.config with the extracted values
+            config_updates = {
+                'model_type': model_type,
+                'hidden_size': hidden_size,
+                'depth': depth,
+                'num_heads': num_heads,
+                'num_channels': num_channels,
+                'image_size': image_size,
+                'patch_size': patch_size,
+                'text_max_length': text_max_length,
+                'text_encoder_output_dim': text_encoder_output_dim,
+                'projection_factor': projection_factor
+            }
+            for key, value in config_updates.items():
+                setattr(self.config, key, value)
         
         # Store non-config parameters as instance attributes (not in config)
         self.distributed = distributed
@@ -412,11 +444,12 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         if teacher_checkpoint_path is not None:
             print(f"[Student Model] Loading teacher weights from: {teacher_checkpoint_path}")
             # Use the projection mapper to load and project teacher weights
+            # Note: Model is initialized on CPU and moved to device after initialization (see line ~970)
             load_and_project_weights(
                 student_model=self,
                 teacher_checkpoint_path=teacher_checkpoint_path,
                 config=config,
-                device=device if device is not None else 'cpu'
+                device='cpu'
             )
 
     def forward(self, latent_0, latent_1, timestep, encoder_hidden_states):
