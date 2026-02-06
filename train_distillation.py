@@ -374,7 +374,8 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         """
         # Handle backward compatibility: if model_type is a dict, extract params
         # Note: This is for backward compatibility only. New code should pass individual params.
-        if isinstance(model_type, dict):
+        is_dict_init = isinstance(model_type, dict)
+        if is_dict_init:
             config = model_type
             model_type = config.get("model_type", "WanLiteStudent")
             hidden_size = config["hidden_size"]
@@ -391,6 +392,21 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
             config = SimpleConfig(hidden_size, depth, num_heads)
         
         super().__init__()
+        
+        # Fix config when using backward compatibility (dict initialization)
+        # The @register_to_config decorator captures the dict, but we need individual values
+        if is_dict_init:
+            # Manually update self.config with the extracted values
+            self.config.model_type = model_type
+            self.config.hidden_size = hidden_size
+            self.config.depth = depth
+            self.config.num_heads = num_heads
+            self.config.num_channels = num_channels
+            self.config.image_size = image_size
+            self.config.patch_size = patch_size
+            self.config.text_max_length = text_max_length
+            self.config.text_encoder_output_dim = text_encoder_output_dim
+            self.config.projection_factor = projection_factor
         
         # Store non-config parameters as instance attributes (not in config)
         self.distributed = distributed
