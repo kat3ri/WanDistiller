@@ -327,8 +327,13 @@ def map_teacher_to_student_key(student_key, student_block_idx, layer_mapping):
     elif '.attn.out_proj.bias' in student_key:
         # Direct mapping
         return [(f'blocks.{teacher_block_idx}.self_attn.o.bias', None)]
+    elif '.mlp.' in student_key:
+        # Student uses 'mlp', teacher uses 'ffn'
+        teacher_key = student_key.replace(f'blocks.{student_block_idx}.', f'blocks.{teacher_block_idx}.')
+        teacher_key = teacher_key.replace('.mlp.', '.ffn.')
+        return [(teacher_key, None)]
     else:
-        # For other parameters (norm1, norm2, mlp), try direct mapping with teacher block index
+        # For other parameters (norm1, norm2), try direct mapping with teacher block index
         teacher_key = student_key.replace(f'blocks.{student_block_idx}.', f'blocks.{teacher_block_idx}.')
         return [(teacher_key, None)]
 
