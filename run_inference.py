@@ -29,7 +29,6 @@ try:
     from train_distillation import WanLiteStudent
     from wan.text2video import WanT2V
     from wan.configs.wan_t2v_A14B import t2v_A14B
-    from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
     from easydict import EasyDict
 except ImportError as e:
     print("="*80, file=sys.stderr)
@@ -48,7 +47,6 @@ def main():
     parser.add_argument("--prompt", type=str, required=True, help="The text prompt for image generation.")
     parser.add_argument("--output_path", type=str, default="inference_result.png", help="Path to save the generated image.")
     parser.add_argument("--num_inference_steps", type=int, default=20, help="Number of inference steps.")
-    parser.add_argument("--shift", type=float, default=5.0, help="Flow matching shift parameter (default: 5.0).")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run on ('cuda' or 'cpu').")
     args = parser.parse_args()
 
@@ -134,44 +132,75 @@ def main():
 
         # Generate initial noise
         student_config = student_model.config
+        batch_size = 1
         latents = torch.randn(
-            1, # batch size
+            batch_size,
             student_config.num_channels,
             student_config.image_size // student_config.patch_size,
             student_config.image_size // student_config.patch_size,
             device=device
         )
 
-        # Use Flow Matching scheduler (same as teacher model in wan/text2video.py line 394-398)
-        print(f"Running Flow Matching sampling for {args.num_inference_steps} steps (shift={args.shift})...")
-        # Initialize the scheduler with same settings as teacher
-        scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=1000,
-            shift=1,
-            use_dynamic_shifting=False
-        )
-        scheduler.set_timesteps(args.num_inference_steps, device=device, shift=args.shift)
-        timesteps = scheduler.timesteps
+        # Multi-step DDIM sampling (matching training approach)
+        print(f"Running DDIM sampling for {args.num_inference_steps} steps...")
+        # Create timestep schedule from high (999) to low (0)
+        timesteps = torch.linspace(999, 0, args.num_inference_steps, dtype=torch.long, device=device)
         
+        # Start with pure noise
         current_latents = latents
-
+        
+        # Epsilon for numerical stability
+        epsilon = 1e-3
+        
+        # Iterative denoising loop
         for i, t in enumerate(timesteps):
-            # Prepare timestep tensor
-            timestep_batch = torch.full((1,), t, device=device, dtype=torch.long)
+            # Prepare timestep tensor for batch
+            timestep_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
             
-            # Get noise prediction from student model
-            noise_pred = student_model(current_latents, None, timestep_batch, text_embeddings)
+            # Get model prediction for noise at timestep t
+            noise_pred = student_model(
+                latent_0=current_latents,
+                latent_1=None,
+                timestep=timestep_batch,
+                encoder_hidden_states=text_embeddings,
+            )
             
-            # Use the scheduler to compute the next sample
-            current_latents = scheduler.step(
-                noise_pred, 
-                t, 
-                current_latents,
-                return_dict=False
-            )[0]
+            # DDIM update step
+            # Calculate alpha values for DDIM sampling
+            # In DDPM/DDIM: x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * noise
+            # alpha should be HIGH at low t (clean) and LOW at high t (noisy)
+            # So at t=999 (noisy): alpha≈0, at t=0 (clean): alpha≈1
+            alpha_t = 1.0 - (t.float() / 1000.0)  # t=999 -> alpha=0.001, t=0 -> alpha=1.0
+            
+            # Clamp alpha_t for numerical stability (maintain tensor type)
+            alpha_t = torch.clamp(alpha_t, min=epsilon, max=1.0 - epsilon)
+            
+            # For the previous timestep, use 1.0 for the final step to get clean output
+            if i < len(timesteps) - 1:
+                alpha_t_prev = 1.0 - (timesteps[i+1].float() / 1000.0)
+                # Clamp alpha_t_prev for intermediate steps
+                alpha_t_prev = torch.clamp(alpha_t_prev, min=epsilon, max=1.0 - epsilon)
+            else:
+                # Final step: alpha_t_prev should be 1.0 for fully denoised output (no clamping)
+                alpha_t_prev = torch.tensor(1.0, device=device)
+            
+            # Precompute square roots for efficiency
+            sqrt_alpha_t = torch.sqrt(alpha_t)
+            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+            sqrt_alpha_t_prev = torch.sqrt(alpha_t_prev)
+            sqrt_one_minus_alpha_t_prev = torch.sqrt(1 - alpha_t_prev)
+            
+            # Compute predicted original sample (x_0)
+            pred_original_sample = (current_latents - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+            
+            # Compute direction pointing to x_t
+            pred_sample_direction = sqrt_one_minus_alpha_t_prev * noise_pred
+            
+            # Compute x_{t-1}
+            current_latents = sqrt_alpha_t_prev * pred_original_sample + pred_sample_direction
 
         denoised_latents = current_latents
-        print("✓ Denoising complete.")
+        print("✓ DDIM denoising complete.")
 
         # Apply the projection layer to match VAE's expected channel dimension
         if output_proj_layer is not None:
