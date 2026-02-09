@@ -284,6 +284,12 @@ The `projection_mapper.py` converts teacher weights:
 
 ## 🐛 Troubleshooting
 
+### Inference Produces Garbage Output (Despite Good Training Loss)
+
+**Problem**: Using wrong noise scheduler in inference  
+**Solution**: See [VAE_USAGE_FIX.md](VAE_USAGE_FIX.md) for detailed explanation  
+**Summary**: The inference script now uses Flow Matching scheduler (matching the teacher) instead of the incorrect DDIM implementation. Update to the latest `run_inference.py` which includes the fix.
+
 ### Out of Memory (OOM) Errors
 
 If you encounter CUDA Out of Memory errors during distributed training:
