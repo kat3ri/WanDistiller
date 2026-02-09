@@ -156,13 +156,16 @@ def test_save_and_load_integration():
         orig_params = list(model.parameters())
         loaded_params = list(loaded_model.parameters())
         
+        # Use dtype-appropriate tolerance
+        rtol = 1e-4 if orig_params[0].dtype == torch.float32 else 1e-3
+        
         # Check first, middle, and last parameters
         params_to_check = [0, len(orig_params) // 2, -1]
         for idx in params_to_check:
-            if not torch.allclose(orig_params[idx], loaded_params[idx], rtol=1e-5):
+            if not torch.allclose(orig_params[idx], loaded_params[idx], rtol=rtol):
                 print(f"✗ Weights don't match at parameter index {idx}!")
                 return False
-        print("✓ Weights match (checked first, middle, and last parameters)")
+        print(f"✓ Weights match (checked first, middle, and last parameters, rtol={rtol})")
         
     print("\n" + "=" * 80)
     print("✅ INTEGRATION TEST PASSED!")

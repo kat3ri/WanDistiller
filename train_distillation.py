@@ -574,8 +574,8 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         from safetensors.torch import load_file
         import json
         
-        # Validate path to prevent directory traversal
-        pretrained_model_name_or_path = os.path.normpath(pretrained_model_name_or_path)
+        # Validate and normalize path to prevent directory traversal
+        pretrained_model_name_or_path = os.path.abspath(pretrained_model_name_or_path)
         if not os.path.isdir(pretrained_model_name_or_path):
             raise ValueError(f"Invalid model path: {pretrained_model_name_or_path}")
         
