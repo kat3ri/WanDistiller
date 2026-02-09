@@ -279,6 +279,65 @@ def select_teacher_layers(num_student_layers, num_teacher_layers=40):
     return selected_indices
 
 
+def map_teacher_to_student_key(student_key, student_block_idx, layer_mapping):
+    """
+    Map a student parameter key to the corresponding teacher parameter key.
+    
+    Handles the architectural differences between teacher (WanAttentionBlock) and 
+    student (WanTransformerBlock):
+    - Teacher uses self_attn with separate q, k, v, o projections
+    - Student uses attn (nn.MultiheadAttention) with in_proj (combined q,k,v) and out_proj
+    
+    Args:
+        student_key: Student parameter key (e.g., 'blocks.0.attn.in_proj_weight')
+        student_block_idx: Student block index
+        layer_mapping: List mapping student layers to teacher layers
+        
+    Returns:
+        List of (teacher_key, slice_info) tuples for mapping teacher params to student.
+        slice_info is None for direct copy, or ('cat', dim) for concatenation along dim.
+    """
+    # Map student block index to teacher block index
+    teacher_block_idx = layer_mapping[student_block_idx] if student_block_idx < len(layer_mapping) else student_block_idx
+    
+    # Handle MultiheadAttention parameter mapping
+    # Student uses nn.MultiheadAttention which has in_proj_weight (concatenated q,k,v) and out_proj
+    # Teacher uses separate q, k, v, o linear layers
+    
+    if '.attn.in_proj_weight' in student_key:
+        # Student's in_proj_weight = [q_weight; k_weight; v_weight] concatenated
+        # Map to teacher's self_attn.q, self_attn.k, self_attn.v
+        base_key = f'blocks.{teacher_block_idx}.self_attn'
+        return [
+            (f'{base_key}.q.weight', ('cat', 0)),  # Concatenate along dim 0
+            (f'{base_key}.k.weight', ('cat', 0)),
+            (f'{base_key}.v.weight', ('cat', 0)),
+        ]
+    elif '.attn.in_proj_bias' in student_key:
+        # Student's in_proj_bias = [q_bias; k_bias; v_bias] concatenated
+        base_key = f'blocks.{teacher_block_idx}.self_attn'
+        return [
+            (f'{base_key}.q.bias', ('cat', 0)),
+            (f'{base_key}.k.bias', ('cat', 0)),
+            (f'{base_key}.v.bias', ('cat', 0)),
+        ]
+    elif '.attn.out_proj.weight' in student_key:
+        # Direct mapping
+        return [(f'blocks.{teacher_block_idx}.self_attn.o.weight', None)]
+    elif '.attn.out_proj.bias' in student_key:
+        # Direct mapping
+        return [(f'blocks.{teacher_block_idx}.self_attn.o.bias', None)]
+    elif '.mlp.' in student_key:
+        # Student uses 'mlp', teacher uses 'ffn'
+        teacher_key = student_key.replace(f'blocks.{student_block_idx}.', f'blocks.{teacher_block_idx}.')
+        teacher_key = teacher_key.replace('.mlp.', '.ffn.')
+        return [(teacher_key, None)]
+    else:
+        # For other parameters (norm1, norm2), try direct mapping with teacher block index
+        teacher_key = student_key.replace(f'blocks.{student_block_idx}.', f'blocks.{teacher_block_idx}.')
+        return [(teacher_key, None)]
+
+
 def load_and_project_weights(student_model, teacher_checkpoint_path, config=None, device="cuda", projection_method='truncate'):
     """
     Loads weights from Teacher (Wan 2.2 - 3D Video Model) to Student (2D Image Model).
@@ -289,7 +348,8 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
     2. Stripping temporal dimensions from the teacher model (Conv3D → Conv2D)
     3. Projecting weights when dimensions don't match (5120 → 1024)
     4. Mapping teacher layers to student layers (40 → 16)
-    5. Intelligently initializing weights for size mismatches
+    5. Handling attention module differences (self_attn.q/k/v/o → attn.in_proj/out_proj)
+    6. Intelligently initializing weights for size mismatches
     
     The teacher model has temporal/motion components that are removed in the student.
     The student is purely spatial (2D) for static image generation.
@@ -347,11 +407,15 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
         'skipped': 0,
         'conv3d_to_2d': 0
     }
+    
+    # Logging configuration
+    MAX_PROJECTION_LOGS = 10  # Maximum number of projection messages to print
 
     # Iterate over student parameters
     for student_key, student_param in student_state_dict.items():
+        transferred = False
         
-        # --- Try exact match first ---
+        # --- Try exact match first (for non-block parameters like text_proj, time_embed, etc.) ---
         if student_key in teacher_state_dict:
             teacher_param = teacher_state_dict[student_key]
             
@@ -365,7 +429,7 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
                 # Direct copy
                 student_param.data.copy_(teacher_param.data)
                 projection_stats['exact_matches'] += 1
-                continue
+                transferred = True
             else:
                 # Dimension mismatch - project
                 try:
@@ -377,57 +441,102 @@ def load_and_project_weights(student_model, teacher_checkpoint_path, config=None
                     student_param.data.copy_(projected.to(student_param.device))
                     projection_stats['projected'] += 1
                     print(f"[Projection] Projected {student_key}: {teacher_param.shape} → {student_param.shape}")
+                    transferred = True
                 except Exception as e:
                     print(f"[Projection] Error projecting {student_key}: {e}")
                     projection_stats['skipped'] += 1
-                continue
         
-        # --- Handle transformer blocks with layer mapping ---
-        if 'blocks.' in student_key:
+        # --- Handle transformer blocks with layer mapping and key translation ---
+        if not transferred and 'blocks.' in student_key:
             parts = student_key.split('.')
             if len(parts) >= 2 and parts[0] == 'blocks':
                 try:
                     student_block_idx = int(parts[1])
-                    teacher_block_idx = layer_mapping[student_block_idx] if student_block_idx < len(layer_mapping) else student_block_idx
                     
-                    # Map student block to selected teacher block
-                    teacher_key = student_key.replace(
-                        f'blocks.{student_block_idx}.',
-                        f'blocks.{teacher_block_idx}.'
-                    )
+                    # Get mapped teacher keys for this student key
+                    teacher_mappings = map_teacher_to_student_key(student_key, student_block_idx, layer_mapping)
                     
-                    if teacher_key in teacher_state_dict:
-                        teacher_param = teacher_state_dict[teacher_key]
-                        
-                        # Check for Conv3D → Conv2D conversion
-                        if teacher_param.dim() == 5 and student_param.dim() == 4:
-                            teacher_param = convert_conv3d_to_conv2d(teacher_param)
-                            projection_stats['conv3d_to_2d'] += 1
-                        
-                        if student_param.shape == teacher_param.shape:
-                            student_param.data.copy_(teacher_param.data)
-                            projection_stats['exact_matches'] += 1
+                    if teacher_mappings:
+                        # Check if this is a concatenated mapping (e.g., in_proj from q,k,v)
+                        if any(mapping[1] and mapping[1][0] == 'cat' for mapping in teacher_mappings):
+                            # Handle concatenation of multiple teacher params
+                            teacher_params = []
+                            all_found = True
+                            for teacher_key, slice_info in teacher_mappings:
+                                if teacher_key in teacher_state_dict:
+                                    teacher_param = teacher_state_dict[teacher_key]
+                                    
+                                    # Check for Conv3D → Conv2D conversion
+                                    if teacher_param.dim() == 5 and student_param.dim() == 4:
+                                        teacher_param = convert_conv3d_to_conv2d(teacher_param)
+                                        projection_stats['conv3d_to_2d'] += 1
+                                    
+                                    teacher_params.append(teacher_param)
+                                else:
+                                    all_found = False
+                                    break
+                            
+                            if all_found and teacher_params:
+                                try:
+                                    # Concatenate teacher params (q, k, v)
+                                    cat_dim = teacher_mappings[0][1][1] if teacher_mappings[0][1] else 0
+                                    concatenated = torch.cat(teacher_params, dim=cat_dim)
+                                    
+                                    # Project if needed
+                                    if concatenated.shape == student_param.shape:
+                                        student_param.data.copy_(concatenated.data)
+                                        projection_stats['exact_matches'] += 1
+                                        transferred = True
+                                    else:
+                                        projected = project_weight_dimensions(
+                                            concatenated,
+                                            student_param.shape,
+                                            method=projection_method
+                                        )
+                                        student_param.data.copy_(projected.to(student_param.device))
+                                        projection_stats['projected'] += 1
+                                        if projection_stats['projected'] <= MAX_PROJECTION_LOGS:
+                                            print(f"[Projection] Projected {student_key} (concat from {len(teacher_params)} params): {concatenated.shape} → {student_param.shape}")
+                                        transferred = True
+                                except Exception as e:
+                                    print(f"[Projection] Error concatenating/projecting {student_key}: {e}")
                         else:
-                            # Project dimensions
-                            try:
-                                projected = project_weight_dimensions(
-                                    teacher_param,
-                                    student_param.shape,
-                                    method=projection_method
-                                )
-                                student_param.data.copy_(projected.to(student_param.device))
-                                projection_stats['projected'] += 1
-                                if projection_stats['projected'] <= 5:  # Only print first few
-                                    print(f"[Projection] Projected {student_key} (from layer {teacher_block_idx}): {teacher_param.shape} → {student_param.shape}")
-                            except Exception as e:
-                                print(f"[Projection] Error projecting {student_key}: {e}")
-                                projection_stats['skipped'] += 1
-                        continue
+                            # Single teacher param mapping
+                            teacher_key, _ = teacher_mappings[0]
+                            if teacher_key in teacher_state_dict:
+                                teacher_param = teacher_state_dict[teacher_key]
+                                
+                                # Check for Conv3D → Conv2D conversion
+                                if teacher_param.dim() == 5 and student_param.dim() == 4:
+                                    teacher_param = convert_conv3d_to_conv2d(teacher_param)
+                                    projection_stats['conv3d_to_2d'] += 1
+                                
+                                if student_param.shape == teacher_param.shape:
+                                    student_param.data.copy_(teacher_param.data)
+                                    projection_stats['exact_matches'] += 1
+                                    transferred = True
+                                else:
+                                    # Project dimensions
+                                    try:
+                                        projected = project_weight_dimensions(
+                                            teacher_param,
+                                            student_param.shape,
+                                            method=projection_method
+                                        )
+                                        student_param.data.copy_(projected.to(student_param.device))
+                                        projection_stats['projected'] += 1
+                                        if projection_stats['projected'] <= MAX_PROJECTION_LOGS:
+                                            teacher_block_idx = layer_mapping[student_block_idx] if student_block_idx < len(layer_mapping) else student_block_idx
+                                            print(f"[Projection] Projected {student_key} (from layer {teacher_block_idx}): {teacher_param.shape} → {student_param.shape}")
+                                        transferred = True
+                                    except Exception as e:
+                                        print(f"[Projection] Error projecting {student_key}: {e}")
                 except (ValueError, IndexError) as e:
                     print(f"[Projection] Error parsing block index in {student_key}: {e}")
         
-        # If we got here, no projection was applied
-        projection_stats['skipped'] += 1
+        # If we got here and nothing was transferred, mark as skipped
+        if not transferred:
+            projection_stats['skipped'] += 1
     
     # Step 4: Report projection statistics
     print()
