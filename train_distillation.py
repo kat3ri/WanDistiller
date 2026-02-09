@@ -356,6 +356,10 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         """
         Initialize WanLiteStudent with parameters compatible with WAN model structure.
         
+        This constructor supports two calling patterns for backward compatibility:
+        1. Individual parameters (recommended): WanLiteStudent(hidden_size=1024, depth=16, ...)
+        2. Config dict (legacy): WanLiteStudent(config_dict, teacher_checkpoint_path=..., ...)
+        
         Args:
             model_type: Model identifier (or dict for backward compat - not recommended)
             hidden_size: Hidden dimension for the model
@@ -368,7 +372,6 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
             text_encoder_output_dim: Output dimension of text encoder (e.g., 4096 for UMT5)
             projection_factor: Factor for weight projection from teacher
             teacher_checkpoint_path: Path to teacher checkpoint for weight initialization (not saved)
-            device: Target device for model (not saved)
             distributed: Whether running in distributed mode (not saved)
             use_gradient_checkpointing: Enable gradient checkpointing for memory savings (not saved)
         """
@@ -571,6 +574,11 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         from safetensors.torch import load_file
         import json
         
+        # Validate path to prevent directory traversal
+        pretrained_model_name_or_path = os.path.normpath(pretrained_model_name_or_path)
+        if not os.path.isdir(pretrained_model_name_or_path):
+            raise ValueError(f"Invalid model path: {pretrained_model_name_or_path}")
+        
         # 1. Load config.json
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
         if not os.path.exists(config_path):
@@ -584,21 +592,27 @@ class WanLiteStudent(ModelMixin, ConfigMixin):
         
         # 2. Initialize model with config (WITHOUT teacher_checkpoint_path to skip projection)
         # Note: teacher_checkpoint_path defaults to None and is not saved in config
-        model = cls(
-            model_type=config_dict.get('model_type', 'WanLiteStudent'),
-            hidden_size=config_dict['hidden_size'],
-            depth=config_dict['depth'],
-            num_heads=config_dict['num_heads'],
-            num_channels=config_dict['num_channels'],
-            image_size=config_dict['image_size'],
-            patch_size=config_dict['patch_size'],
-            text_max_length=config_dict['text_max_length'],
-            text_encoder_output_dim=config_dict['text_encoder_output_dim'],
-            projection_factor=config_dict.get('projection_factor', 1.0),
-            teacher_checkpoint_path=None,  # IMPORTANT: Don't trigger projection on load
-            distributed=False,
-            use_gradient_checkpointing=False
-        )
+        try:
+            model = cls(
+                model_type=config_dict.get('model_type', 'WanLiteStudent'),
+                hidden_size=config_dict['hidden_size'],
+                depth=config_dict['depth'],
+                num_heads=config_dict['num_heads'],
+                num_channels=config_dict['num_channels'],
+                image_size=config_dict['image_size'],
+                patch_size=config_dict['patch_size'],
+                text_max_length=config_dict['text_max_length'],
+                text_encoder_output_dim=config_dict['text_encoder_output_dim'],
+                projection_factor=config_dict.get('projection_factor', 1.0),
+                teacher_checkpoint_path=None,  # IMPORTANT: Don't trigger projection on load
+                distributed=False,
+                use_gradient_checkpointing=False
+            )
+        except KeyError as e:
+            raise ValueError(
+                f"Missing required configuration parameter in config.json: {e}. "
+                f"Please ensure the config file contains all required model parameters."
+            ) from e
         
         # 3. Load weights - try both possible filenames
         # Standard diffusers uses diffusion_pytorch_model.safetensors

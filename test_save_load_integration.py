@@ -151,13 +151,18 @@ def test_save_and_load_integration():
             assert orig_val == loaded_val, f"Config mismatch for {key}: {orig_val} vs {loaded_val}"
         print("✓ Configuration matches")
         
-        # Check weights match (sample a few parameters)
-        orig_param = next(model.parameters())
-        loaded_param = next(loaded_model.parameters())
-        if not torch.allclose(orig_param, loaded_param, rtol=1e-5):
-            print("✗ Weights don't match!")
-            return False
-        print("✓ Weights match")
+        # Check weights match (check multiple parameters for robustness)
+        print("   Checking weight integrity across multiple layers...")
+        orig_params = list(model.parameters())
+        loaded_params = list(loaded_model.parameters())
+        
+        # Check first, middle, and last parameters
+        params_to_check = [0, len(orig_params) // 2, -1]
+        for idx in params_to_check:
+            if not torch.allclose(orig_params[idx], loaded_params[idx], rtol=1e-5):
+                print(f"✗ Weights don't match at parameter index {idx}!")
+                return False
+        print("✓ Weights match (checked first, middle, and last parameters)")
         
     print("\n" + "=" * 80)
     print("✅ INTEGRATION TEST PASSED!")
