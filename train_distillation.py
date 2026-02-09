@@ -1183,7 +1183,7 @@ def main():
             print(f"  ℹ Distributed Training Info:")
             print(f"    - Total prompts in dataset: {len(dataset)}")
             print(f"    - Number of GPUs/processes: {world_size}")
-            print(f"    - Prompts per GPU per epoch: ~{prompts_per_gpu}")
+            print(f"    - Prompts per GPU per epoch: {prompts_per_gpu} (may include padding)")
             print(f"    - Steps per GPU per epoch: {steps_per_epoch_per_gpu}")
             print(f"    - Total steps across all GPUs per epoch: {total_steps_per_epoch}")
     else:
@@ -1610,7 +1610,7 @@ def main():
             break
         if is_main_process(rank) and num_batches > 0:
             if args.distributed:
-                print(f"Epoch {epoch + 1}/{args.num_epochs} complete (Rank {rank}). Steps this GPU: {num_batches}, Average Loss: {epoch_loss / num_batches:.6f}")
+                print(f"Epoch {epoch + 1}/{args.num_epochs} complete (Rank {rank}). Steps on this GPU: {num_batches}, Average Loss: {epoch_loss / num_batches:.6f}")
             else:
                 print(f"Epoch {epoch + 1}/{args.num_epochs} complete. Steps: {num_batches}, Average Loss: {epoch_loss / num_batches:.6f}")
 
