@@ -142,7 +142,7 @@ def main():
             device=device
         )
 
-        # Use Flow Matching scheduler (same as teacher model)
+        # Use Flow Matching scheduler (same as teacher model in wan/text2video.py line 394-398)
         print(f"Running Flow Matching sampling for {args.num_inference_steps} steps (shift={args.shift})...")
         # Initialize the scheduler with same settings as teacher
         scheduler = FlowUniPCMultistepScheduler(
@@ -163,7 +163,6 @@ def main():
             noise_pred = student_model(current_latents, None, timestep_batch, text_embeddings)
             
             # Use the scheduler to compute the next sample
-            # Note: scheduler.step expects input in [B, C, H, W] format
             current_latents = scheduler.step(
                 noise_pred, 
                 t, 
