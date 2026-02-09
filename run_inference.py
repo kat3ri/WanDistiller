@@ -62,7 +62,9 @@ def main():
         print("✓ Student model loaded.")
     except Exception as e:
         print(f"❌ ERROR: Failed to load student model from {args.model_path}", file=sys.stderr)
-        print(f"   Please ensure the path is correct and contains 'config.json' and 'diffusion_model.safetensors'.", file=sys.stderr)
+        print(f"   Please ensure the path is correct and contains:", file=sys.stderr)
+        print(f"   - config.json (model configuration)", file=sys.stderr)
+        print(f"   - diffusion_pytorch_model.safetensors or diffusion_model.safetensors (model weights)", file=sys.stderr)
         print(f"   Error details: {e}", file=sys.stderr)
         sys.exit(1)
 
