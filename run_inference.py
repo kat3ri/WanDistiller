@@ -29,6 +29,7 @@ try:
     from train_distillation import WanLiteStudent
     from wan.text2video import WanT2V
     from wan.configs.wan_t2v_A14B import t2v_A14B
+    from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
     from easydict import EasyDict
 except ImportError as e:
     print("="*80, file=sys.stderr)
@@ -46,7 +47,8 @@ def main():
     parser.add_argument("--teacher_path", type=str, required=True, help="Path to the original WAN teacher model directory (for VAE and text encoder).")
     parser.add_argument("--prompt", type=str, required=True, help="The text prompt for image generation.")
     parser.add_argument("--output_path", type=str, default="inference_result.png", help="Path to save the generated image.")
-    parser.add_argument("--num_inference_steps", type=int, default=20, help="Number of DDIM inference steps.")
+    parser.add_argument("--num_inference_steps", type=int, default=20, help="Number of inference steps.")
+    parser.add_argument("--shift", type=float, default=5.0, help="Flow matching shift parameter (default: 5.0).")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run on ('cuda' or 'cpu').")
     args = parser.parse_args()
 
@@ -140,26 +142,33 @@ def main():
             device=device
         )
 
-        # DDIM sampling loop
-        print(f"Running DDIM sampling for {args.num_inference_steps} steps...")
-        timesteps = torch.linspace(999, 0, args.num_inference_steps, dtype=torch.long, device=device)
+        # Use Flow Matching scheduler (same as teacher model in wan/text2video.py line 394-398)
+        print(f"Running Flow Matching sampling for {args.num_inference_steps} steps (shift={args.shift})...")
+        # Initialize the scheduler with same settings as teacher
+        scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=1000,
+            shift=1,
+            use_dynamic_shifting=False
+        )
+        scheduler.set_timesteps(args.num_inference_steps, device=device, shift=args.shift)
+        timesteps = scheduler.timesteps
+        
         current_latents = latents
-        epsilon = 1e-3
 
         for i, t in enumerate(timesteps):
+            # Prepare timestep tensor
             timestep_batch = torch.full((1,), t, device=device, dtype=torch.long)
             
+            # Get noise prediction from student model
             noise_pred = student_model(current_latents, None, timestep_batch, text_embeddings)
             
-            alpha_t = 1.0 - (t.float() / 1000.0)
-            alpha_t = torch.clamp(alpha_t, min=epsilon, max=1.0 - epsilon)
-            
-            alpha_t_prev = 1.0 - (timesteps[i+1].float() / 1000.0) if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
-            alpha_t_prev = torch.clamp(alpha_t_prev, min=epsilon, max=1.0 - epsilon) if i < len(timesteps) - 1 else alpha_t_prev
-            
-            pred_original_sample = (current_latents - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-            pred_sample_direction = torch.sqrt(1 - alpha_t_prev) * noise_pred
-            current_latents = torch.sqrt(alpha_t_prev) * pred_original_sample + pred_sample_direction
+            # Use the scheduler to compute the next sample
+            current_latents = scheduler.step(
+                noise_pred, 
+                t, 
+                current_latents,
+                return_dict=False
+            )[0]
 
         denoised_latents = current_latents
         print("✓ Denoising complete.")
