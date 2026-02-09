@@ -1174,6 +1174,18 @@ def main():
         )
         if is_main_process(rank):
             print(f"✓ DistributedSampler and DataLoader created (batch_size={args.batch_size}, num_workers={args.num_workers}).")
+            # Calculate and display steps per epoch for distributed training
+            prompts_per_gpu = len(dataset) // world_size
+            if len(dataset) % world_size != 0:
+                prompts_per_gpu += 1  # Account for padding in DistributedSampler
+            steps_per_epoch_per_gpu = (prompts_per_gpu + args.batch_size - 1) // args.batch_size
+            total_steps_per_epoch = steps_per_epoch_per_gpu * world_size
+            print(f"  ℹ Distributed Training Info:")
+            print(f"    - Total prompts in dataset: {len(dataset)}")
+            print(f"    - Number of GPUs/processes: {world_size}")
+            print(f"    - Prompts per GPU per epoch: {prompts_per_gpu} (may include padding)")
+            print(f"    - Steps per GPU per epoch: {steps_per_epoch_per_gpu}")
+            print(f"    - Total steps across all GPUs per epoch: {total_steps_per_epoch}")
     else:
         dataloader = torch.utils.data.DataLoader(
             dataset, 
@@ -1183,6 +1195,8 @@ def main():
         )
         if is_main_process(rank):
             print(f"✓ DataLoader created (batch_size={args.batch_size}, num_workers={args.num_workers}).")
+            steps_per_epoch = (len(dataset) + args.batch_size - 1) // args.batch_size
+            print(f"  ℹ Steps per epoch: {steps_per_epoch}")
 
     # 8. Optimizer and Loss
     if is_main_process(rank):
@@ -1595,7 +1609,10 @@ def main():
                 print(f"Reached max steps ({args.num_steps}). Stopping training.")
             break
         if is_main_process(rank) and num_batches > 0:
-            print(f"Epoch {epoch + 1}/{args.num_epochs} complete. Average Loss: {epoch_loss / num_batches:.6f}")
+            if args.distributed:
+                print(f"Epoch {epoch + 1}/{args.num_epochs} complete (Rank {rank}). Steps on this GPU: {num_batches}, Average Loss: {epoch_loss / num_batches:.6f}")
+            else:
+                print(f"Epoch {epoch + 1}/{args.num_epochs} complete. Steps: {num_batches}, Average Loss: {epoch_loss / num_batches:.6f}")
 
     # 10. Save Model (only from main process)
     if is_main_process(rank):
