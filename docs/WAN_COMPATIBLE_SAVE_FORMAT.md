@@ -81,6 +81,8 @@ When you call `model.save_pretrained(output_dir)`, the following is saved:
 
 ### config.json
 Contains all model architecture parameters:
+- `_class_name`: Model class name (default: "WanLiteStudent") - **Required by ComfyUI**
+- `_diffusers_version`: Diffusers library version for compatibility tracking
 - `model_type`: Model identifier (default: "WanLiteStudent")
 - `hidden_size`: Hidden dimension
 - `depth`: Number of transformer blocks
@@ -229,6 +231,15 @@ This will verify:
 **Solution**: Ensure the model directory contains:
 1. `config.json` (not `student_config.json`)
 2. `diffusion_model.safetensors` (not other weight formats)
+3. `_class_name` field in config.json (automatically added as of this fix)
+
+If you have an old model without `_class_name`, re-save it with the updated code to add the required metadata.
+
+### Issue: 'NoneType' object has no attribute 'clone' error in ComfyUI
+
+**Solution**: This error occurs when the `_class_name` field is missing from `config.json`. The fix automatically adds this field when saving models. Re-save your model using `model.save_pretrained()` to include the required metadata.
+
+See `COMFY_UI_FIX_SUMMARY.md` for detailed information about this fix.
 
 ### Issue: Config parameters missing
 
